@@ -1,0 +1,40 @@
+# 换行符策略
+#
+# ⚠ 关键：Beken 厂商 SDK 的源文件本身就是 CRLF 行尾。`tools/gen_patch.py`
+# 生成的补丁依赖这一点——用 `patch --binary -p1` 打补丁时，若 git 把 src/
+# 下的文件转成 LF，hunk 会全部 FAILED（different line endings）。
+# 因此 **SDK 源文件（src/）与补丁（*.patch）必须原样保留 CRLF，不做转换**。
+#
+# ⚠ 踩过的坑：规则顺序在这里至关重要。
+#先写的 `* text=auto` 会让 git 对所有文本文件做行尾规范化（入库时 CRLF→LF），
+# 而后面写的 `-text` **无法把它改回来**——`-text` 只表示"不做转换"，
+# 但如果前面已经被 text=auto 规范化过，行尾早就没了。
+# 所以下面把 `* text=auto` 这条**删掉**，改为对每类文件显式声明。
+
+# --- 强制 LF：项目自己写的脚本与文档 ---
+# ⚠ 写这一行时`*` 与 `text` 之间**必须有空格**：`*.shtext eol=lf` 会被git
+# 解析成"匹配名为 *.shtext 的文件"，于是 `*.sh` 规则**静默失效**，
+# src/apply.sh 就会在 Windows 上被 autocrlf 变成 CRLF，Linux 下失去可执行性。
+*.sh   text eol=lf
+*.py   text eol=lf
+*.md   text eol=lf
+*.txt  text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+.gitignore     text eol=lf
+.gitattributes text eol=lf
+
+# --- 保持原样不转换：厂商 SDK 源文件与补丁 ---
+# 必须在任何 text 规则**之前**声明（虽然 git 是逐行匹配后取最后命中，
+# 但显式写清楚更利于维护）
+src/modified/**        -text
+src/vendor-pristine/** -text
+*.patch                -text
+
+# --- 二进制：不做任何转换 ---
+*.bin  binary
+*.elf  binary
+*.exe  binary
+*.a    binary
+*.docx binary
+*.doc  binary

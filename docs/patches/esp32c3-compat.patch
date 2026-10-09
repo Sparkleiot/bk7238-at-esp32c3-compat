@@ -1,0 +1,2767 @@
+# BK7238 / XH-WB3S  ——  ESP32-C3 (ESP-AT) 兼容改造补丁
+# 生成时间: 2026-10-09 14:42:33
+# 应用方式: cd <SDK根> && patch --binary -p1 < docs/patches/esp32c3-compat.patch
+#   【必须加 --binary】SDK 源码是 CRLF 行尾, MSYS/Git-Bash 自带的 patch 默认
+#   会做 CRLF<->LF 转换, 于是上下文行永远匹配不上, 报
+#   "Hunk #N FAILED ... (different line endings)"。--binary 关掉该转换即可。
+#
+# 本补丁覆盖 26 个已改文件。另外两类改动不在本补丁内:
+#   1) 新增文件 atsvr_esp_compat.c          -> 由 src/apply.sh 直接拷贝
+#   2) 构建脚本层 3 个文件(.orig2 后缀)     -> 由 tools/patch_build_scripts.py 处理
+
+--- a/beken378/func/at_server/network/net_hal/HAL_DTLS_mbedtls.c
++++ b/beken378/func/at_server/network/net_hal/HAL_DTLS_mbedtls.c
+@@ -224,7 +224,14 @@
+         goto error;
+     }
+ 
+-    mbedtls_ssl_conf_authmode(&(pDataParams->ssl_conf), MBEDTLS_SSL_VERIFY_REQUIRED);
++    /* ESP-AT 兼容修复: 与 HAL_TLS_mbedtls.c 同一问题 —— 原厂硬编码 VERIFY_REQUIRED,
++       而 AT 层无法下发 CA => DTLS 握手也必然失败。按 AT+CIPSSLCCONF 的 auth_mode
++       语义: 0 = 不认证(默认)。*/
++    if (pConnectParams->auth_mode == 0) {
++        mbedtls_ssl_conf_authmode(&(pDataParams->ssl_conf), MBEDTLS_SSL_VERIFY_NONE);
++    } else {
++        mbedtls_ssl_conf_authmode(&(pDataParams->ssl_conf), MBEDTLS_SSL_VERIFY_REQUIRED);
++    }
+ 
+     mbedtls_ssl_conf_rng(&pDataParams->ssl_conf, mbedtls_ctr_drbg_random, &pDataParams->ctr_drbg);
+     mbedtls_ssl_conf_dbg(&pDataParams->ssl_conf, _dtls_debug, NULL);
+@@ -360,6 +367,13 @@
+     if (rc <= 0) {
+         *read_len = 0;
+         switch (rc) {
++            case 0:
++                /* ESP-AT 兼容修复: mbedtls 的 recv BIO 在"暂时无数据/读超时"时返回 0。
++                   原厂让0 掉进 default 直接原样返回, 而 0 == ATSVR_RET_SUCCESS,
++                   上位机会收到一个 read_len=0 的假 +IPD,0,。这里按"无数据"处理。*/
++                rc = ATSVR_ERR_SSL_READ_TIMEOUT;
++                break;
++
+             case MBEDTLS_ERR_SSL_TIMEOUT:
+                 rc = ATSVR_ERR_SSL_READ_TIMEOUT;
+                 break;
+
+--- a/beken378/func/at_server/network/net_hal/HAL_TCP_lwip.c
++++ b/beken378/func/at_server/network/net_hal/HAL_TCP_lwip.c
+@@ -76,13 +76,44 @@
+             continue;
+         }
+ 
+-        if (connect(fd, cur->ai_addr, cur->ai_addrlen) == 0) {
+-            ret = fd + LWIP_SOCKET_FD_SHIFT;
+-            break;
+-        }
++        /* ESP-AT 兼容: 带超时的 connect。
++           原厂用阻塞 connect, 对端不可达/SYN 被丢时会卡住 20s 以上,
++           上位机会永远等不到应答。这里改为非阻塞 + select 限时 10s,
++           失败则及时返回, 让 AT 层回 ERROR。 */
++        {
++            int fl = fcntl(fd, F_GETFL, 0);
++            int soerr = 0;
++            socklen_t solen = sizeof(soerr);
++            struct timeval tv;
++            fd_set wfds;
+ 
+-        close(fd);
+-        ret = 0;
++            if (fl >= 0) {
++                fcntl(fd, F_SETFL, fl | O_NONBLOCK);
++            }
++            if (connect(fd, cur->ai_addr, cur->ai_addrlen) == 0) {
++                if (fl >= 0) {
++                    fcntl(fd, F_SETFL, fl);
++                }
++                ret = fd + LWIP_SOCKET_FD_SHIFT;
++                break;
++            }
++            FD_ZERO(&wfds);
++            FD_SET(fd, &wfds);
++            tv.tv_sec  = 10;
++            tv.tv_usec = 0;
++            if (select(fd + 1, NULL, &wfds, NULL, &tv) > 0 && FD_ISSET(fd, &wfds)) {
++                getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &solen);
++                if (soerr == 0) {
++                    if (fl >= 0) {
++                        fcntl(fd, F_SETFL, fl);
++                    }
++                    ret = fd + LWIP_SOCKET_FD_SHIFT;
++                    break;
++                }
++            }
++            close(fd);
++            ret = 0;
++        }
+     }
+ 
+     if (ret == 0) {
+
+--- a/beken378/func/at_server/network/net_hal/HAL_TLS_mbedtls.c
++++ b/beken378/func/at_server/network/net_hal/HAL_TLS_mbedtls.c
+@@ -159,14 +159,22 @@
+     }
+ #else
+     bk_printf("mbedtls_ssl_conf_psk start\r\n");
+-    if (pConnectParams->psk != NULL && pConnectParams->psk_id != NULL) {
++    /* 原厂这里只判空, 但 mbedtls_ssl_conf_psk 还会校验 psk_len 不得超过
++       MBEDTLS_PSK_MAX_LEN(BKEN 的 config.h 里该宏被注释掉 => 默认 32 字节)。
++       历史上有人把 64 个 hex 字符(=32 字节的十六进制文本, strlen=64)当 PSK 存进 env,
++       于是 conf_psk 直接返回 0x7100 BAD_INPUT_DATA 把整个连接打挂。
++       这里显式校验并退化成"无 PSK", 让证书模式(本移植唯一支持的模式)仍可用。*/
++    if (pConnectParams->psk != NULL && pConnectParams->psk_id[0] != '\0'
++        && pConnectParams->psk_length > 0
++        && pConnectParams->psk_length <= MBEDTLS_PSK_MAX_LEN) {
+ 
+         ATSVRLOG("pConnectParams->psk:%s,pConnectParams->psk_id:%s\r\n",pConnectParams->psk,pConnectParams->psk_id);
+         const char *psk_id = pConnectParams->psk_id;
+         ret                = mbedtls_ssl_conf_psk(&(pDataParams->ssl_conf), (unsigned char *)pConnectParams->psk,
+                                 pConnectParams->psk_length, (const unsigned char *)psk_id, strlen(psk_id));
+     } else {
+-        bk_printf("psk/pskid is empty!");
++        bk_printf("psk/pskid empty or too long (len=%d, max=%d), continue without psk\r\n",
++                  (int)pConnectParams->psk_length, (int)MBEDTLS_PSK_MAX_LEN);
+     }
+ 
+     if (0 != ret) {
+@@ -243,19 +251,35 @@
+ 
+     mbedtls_ssl_conf_verify(&(pDataParams->ssl_conf), _ATSVR_server_certificate_verify, (void *)host);
+ 
+-    mbedtls_ssl_conf_authmode(&(pDataParams->ssl_conf), MBEDTLS_SSL_VERIFY_REQUIRED);
++    /* ESP-AT 兼容修复: 原厂无条件 VERIFY_REQUIRED, 但 AT 层没有装载 CA 的命令,
++       ca_cert 恒为空 => 握手必然失败(无法验证 "unknown CA")。
++       对齐 ESP-AT AT+CIPSSLCCONF 的 auth_mode 语义:
++         auth_mode == 0 (默认, 不认证) -> VERIFY_NONE, TLS 终于能用;
++         auth_mode 2/3 (校验服务端)   -> VERIFY_REQUIRED (需要已装载 CA)。*/
++    if (pConnectParams->auth_mode == 0) {
++        mbedtls_ssl_conf_authmode(&(pDataParams->ssl_conf), MBEDTLS_SSL_VERIFY_NONE);
++    } else {
++        mbedtls_ssl_conf_authmode(&(pDataParams->ssl_conf), MBEDTLS_SSL_VERIFY_REQUIRED);
++    }
+ 
+     mbedtls_ssl_conf_rng(&(pDataParams->ssl_conf), mbedtls_ctr_drbg_random, &(pDataParams->ctr_drbg));
+ 
+     mbedtls_ssl_conf_ca_chain(&(pDataParams->ssl_conf), &(pDataParams->ca_cert), NULL);
+ 
+-    if ((ret = mbedtls_ssl_conf_own_cert(&(pDataParams->ssl_conf), &(pDataParams->client_cert),
+-                                        &(pDataParams->private_key))) != 0) {
+-        bk_printf("mbedtls_ssl_conf_own_cert failed returned 0x%04x", ret < 0 ? -ret : ret);
+-        goto error;
++    /* 只有确实带了客户端证书/私钥(双向认证 auth_mode 1/3)才配置 own_cert。
++       原厂无条件调用, 而 pk_context/crt 是零初始化的空上下文,
++       mbedtls_ssl_conf_own_cert 会因此返回错误直接把连接打挂。*/
++    if (pConnectParams->auth_mode == 1 || pConnectParams->auth_mode == 3) {
++        if ((ret = mbedtls_ssl_conf_own_cert(&(pDataParams->ssl_conf), &(pDataParams->client_cert),
++                                            &(pDataParams->private_key))) != 0) {
++            bk_printf("mbedtls_ssl_conf_own_cert failed returned 0x%04x", ret < 0 ? -ret : ret);
++            goto error;
++        }
+     }
+ 
+-    mbedtls_ssl_conf_read_timeout(&(pDataParams->ssl_conf), pConnectParams->timeout_ms);
++    /* timeout_ms 为 0 会让 mbedtls 读到 read_timeout=0, 行为不可控; 给个兜底。*/
++    mbedtls_ssl_conf_read_timeout(&(pDataParams->ssl_conf),
++                                   pConnectParams->timeout_ms ? pConnectParams->timeout_ms : 10000);
+     if ((ret = mbedtls_ssl_setup(&(pDataParams->ssl), &(pDataParams->ssl_conf))) != 0) {
+         bk_printf("mbedtls_ssl_setup failed returned 0x%04x", ret < 0 ? -ret : ret);
+         goto error;
+@@ -386,8 +410,22 @@
+ 
+         if (read_rc > 0) {
+             *read_len += read_rc;
+-        } else if (read_rc == 0 || (read_rc != MBEDTLS_ERR_SSL_WANT_WRITE && read_rc != MBEDTLS_ERR_SSL_WANT_READ &&
+-                                    read_rc != MBEDTLS_ERR_SSL_TIMEOUT)) {
++        } else if (read_rc == 0) {
++            /* ESP-AT 兼容修复: 原厂把 0 当成致命错误直接 return ATSVR_ERR_SSL_READ,
++               而 network_datarev_thread 见到这个值就判定"对端已关闭"并把链路拆掉
++               (见 network_app.c: `ret == ATSVR_ERR_SSL_READ` -> CLOSED)。
++               但 mbedtls 的 recv BIO 在**读超时**以及"暂时无数据"情形下同样返回 0
++               (net_sockets.c: mbedtls_net_recv_timeout 超时返回 MBEDTLS_ERR_SSL_TIMEOUT,
++                而 mbedtls_net_recv 直接返回 recv() 的值)。
++               结果: TLS 链路上只要出现一小段空窗(例如握手超时兜底 10s 到期),
++               空闲连接就会被误杀, 上位机莫名看到 "0,CLOSED"。
++               这里把 0 当成"暂时没数据": 跳出循环, 落到下面的
++               ATSVR_ERR_SSL_NOTHING_TO_READ —— RX 线程下一轮继续等, 不会误杀链路。
++               真正的对端关闭会返回 MBEDTLS_ERR_SSL_CONN_EOF(负值), 仍走下面的
++               致命分支, 所以不会漏掉真正的断开。*/
++            break;
++        } else if (read_rc != MBEDTLS_ERR_SSL_WANT_WRITE && read_rc != MBEDTLS_ERR_SSL_WANT_READ &&
++                                    read_rc != MBEDTLS_ERR_SSL_TIMEOUT) {
+             bk_printf("cloud_iot_network_tls_read failed: 0x%04x", read_rc < 0 ? -read_rc : read_rc);
+             return ATSVR_ERR_SSL_READ;
+         }
+@@ -398,15 +436,18 @@
+ 
+     } while (*read_len < totalLen);
+ 
+-    if (totalLen == *read_len) {
++    /* ESP-AT 兼容修复: 原厂要求"读满整个缓冲"才算成功
++       (if (totalLen == *read_len) return ATSVR_RET_SUCCESS;),
++       而 TCP 侧 hal_tcp_read_noblock 是单次 recv、读到多少交多少。
++       两者语义不一致 => TLS 上一个 11 字节的回显永远填不满 REV_NETWORK_DATA_LEN,
++       于是返回 ATSVR_ERR_SSL_READ_TIMEOUT, network_datarev_thread 只在
++       `ret == ATSVR_RET_SUCCESS` 时吐 +IPD => **数据被静默丢弃**, 上位机永远收不到。
++       这里对齐 TCP 语义: 只要读到了就成功交付, 剩下的下一轮继续读。*/
++    if (*read_len > 0) {
+         return ATSVR_RET_SUCCESS;
+     }
+ 
+-    if (*read_len == 0) {
+-        return ATSVR_ERR_SSL_NOTHING_TO_READ;
+-    } else {
+-        return ATSVR_ERR_SSL_READ_TIMEOUT;
+-    }
++    return ATSVR_ERR_SSL_NOTHING_TO_READ;
+ }
+ 
+ #ifdef __cplusplus
+
+--- a/beken378/func/at_server/network/net_hal/HAL_UDP_lwip.c
++++ b/beken378/func/at_server/network/net_hal/HAL_UDP_lwip.c
+@@ -23,6 +23,7 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <errno.h>
+ 
+ #include "lwip/inet.h"
+ #include "lwip/netdb.h"
+@@ -89,6 +90,66 @@
+ #undef NETWORK_ADDR_LEN
+ }
+ 
++/* ESP-AT 兼容修复(#10): AT+CIPSTART="UDP",<host>,<port>[,<local port>[,<mode>]] 的
++ * local port 必须绑定到本地 socket, 否则对端按 ESP-AT 文档向该端口回发时
++ * 包全部落空(socket 被 lwIP 绑在随机端口)。local_port=0 时保持原行为。 */
++uintptr_t HAL_UDP_ConnectBind(const char *host, unsigned int port, unsigned short local_port)
++{
++    struct sockaddr_in local_addr;
++    int fd;
++    struct addrinfo hints, *addr_list, *cur;
++    uintptr_t ret = 0;
++    char port_str[6] = {0};
++
++    snprintf(port_str, 6, "%d", port);
++    memset((char *)&hints, 0x00, sizeof(hints));
++    hints.ai_socktype = SOCK_DGRAM;
++    hints.ai_family   = AF_INET;
++    hints.ai_protocol = IPPROTO_UDP;
++
++    if (getaddrinfo(host, port_str, &hints, &addr_list) != 0) {
++        return 0;
++    }
++
++    for (cur = addr_list; cur != NULL; cur = cur->ai_next) {
++        fd = socket(cur->ai_family, cur->ai_socktype, cur->ai_protocol);
++        if (fd < 0) {
++            ret = 0;
++            continue;
++        }
++
++        if (local_port) {
++            memset(&local_addr, 0, sizeof(local_addr));
++            local_addr.sin_family      = AF_INET;
++            local_addr.sin_port        = htons(local_port);
++            local_addr.sin_addr.s_addr = htonl(INADDR_ANY);
++            if (bind(fd, (struct sockaddr *)&local_addr, sizeof(local_addr)) != 0) {
++                ATSVRLOG("udp bind local:%d fail,errno:%d", local_port, errno);
++                close(fd);
++                ret = 0;
++                continue;
++            }
++        }
++
++        if (0 == connect(fd, cur->ai_addr, cur->ai_addrlen)) {
++            ret = fd + LWIP_SOCKET_FD_SHIFT;
++            break;
++        }
++
++        close(fd);
++        ret = 0;
++    }
++
++    if (0 == ret) {
++        ATSVRLOG("fail to establish udp(bind lport=%d)", local_port);
++    } else {
++        ATSVRLOG("success to establish udp lport=%d, fd=%d", local_port, ret);
++    }
++
++    freeaddrinfo(addr_list);
++    return ret;
++}
++
+ void HAL_UDP_Disconnect(uintptr_t fd)
+ {
+     long socket_id = -1;
+
+--- a/beken378/func/at_server/at_server_func/_atsvr_func.c
++++ b/beken378/func/at_server/at_server_func/_atsvr_func.c
+@@ -857,11 +857,15 @@
+ 	char output[300];
+ 	int n;
+ 
+-	n = snprintf(output,300,"<ATVER:%s>\r\n",AT_VERSION);
+-	n += snprintf(output+n,300-n,"<SDKVER:%s>\r\n",BEKEN_SDK_REV);
++	/* ESP-AT (ESP32-C3) 兼容格式: AT version / SDK version / compile time / Bin version */
++	n = snprintf(output,300,"AT version:%s\r\n",AT_VERSION);
++	n += snprintf(output+n,300-n,"SDK version:%s\r\n",BEKEN_SDK_REV);
+ 	#if buildtime
+-	n += snprintf(output+n,300-n,"<buildtime:%s\r\n>",buildtime);
++	n += snprintf(output+n,300-n,"compile time:%s\r\n",buildtime);
++	#else
++	n += snprintf(output+n,300-n,"compile time:%s %s\r\n",__DATE__,__TIME__);
+ 	#endif
++	n += snprintf(output+n,300-n,"Bin version:BK7238-AT(V1.1.0/esp32c3-compat)\r\n");
+ 	n += snprintf(output+n,300 - n,ATSVR_CMD_RSP_SUCCEED);
+ 	_atsvr_output_msg(p_env,output,n);
+ 
+
+--- a/application.mk
++++ b/application.mk
+@@ -309,6 +309,24 @@
+ # Beken SDK include folder and source file list
+ -include ./beken378/beken_src.mk
+ 
++# ---------------------------------------------------------------------------
++# [ESP32-C3 兼容工程 · 宿主机适配] include 列表落盘, 规避 shell 命令行长度上限
++#
++# 本机 make 的 SHELL 是 PortableGit 的 sh, 它把 recipe 交给子进程时命令行
++# 上限约 8KB; 而上面 beken_src.mk 累积出的 INCLUDES 展开后有 11~18KB, 会被
++# 从中间硬截断 —— gcc 于是既收不到源文件名也收不到 -c, 报出极具误导性的:
++#     arm-none-eabi-gcc.exe: error: -E or -x required when input is from standard input
++#     arm-none-eabi-gcc.exe: fatal error: no input files
++# 这与源码、与头文件路径都无关, 纯粹是命令行被截断。
++#
++# 把 include 列表写成 GCC 响应文件, recipe 里只出现 @<文件>, 长度问题彻底消失。
++# (链接命令约 3KB、ar 约 3KB, 均在上限内, 无需处理。)
++# ---------------------------------------------------------------------------
++INCLUDES_FILE := $(OBJ_DIR)/esp_at_includes.rsp
++INCLUDES_RSP := @$(INCLUDES_FILE)
++$(shell mkdir -p $(OBJ_DIR) 2>/dev/null)
++$(file >$(INCLUDES_FILE),$(INCLUDES))
++
+ # Generate obj list
+ # -------------------------------------------------------------------
+ OBJ_LIST = $(SRC_C:%.c=$(OBJ_DIR)/%.o)
+@@ -744,20 +762,20 @@
+ $(OBJ_DIR)/%.o: %.c
+ 	$(Q)if [ ! -d $(dir $@) ]; then mkdir -p $(dir $@); fi
+ 	$(Q)$(ECHO) "  $(GREEN)CC   $<$(NC)"
+-	$(Q)$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+-	$(Q)$(CC) $(CFLAGS) $(INCLUDES) -c $< -MM -MT $@ -MF $(patsubst %.o,%.d,$@)
++	$(Q)$(CC) $(CFLAGS) $(INCLUDES_RSP) -c $< -o $@
++	$(Q)$(CC) $(CFLAGS) $(INCLUDES_RSP) -c $< -MM -MT $@ -MF $(patsubst %.o,%.d,$@)
+ 
+ $(OBJ_DIR)/%.O: %.S
+ 	$(Q)if [ ! -d $(dir $@) ]; then mkdir -p $(dir $@); fi
+ 	$(Q)$(ECHO) "  $(GREEN)AS   $<$(NC)"
+-	$(Q)$(CC) $(ASMFLAGS) $(INCLUDES) -c $< -o $@
+-	$(Q)$(CC) $(ASMFLAGS) $(INCLUDES) -c $< -MM -MT $@ -MF $(patsubst %.O,%.d,$@)
++	$(Q)$(CC) $(ASMFLAGS) $(INCLUDES_RSP) -c $< -o $@
++	$(Q)$(CC) $(ASMFLAGS) $(INCLUDES_RSP) -c $< -MM -MT $@ -MF $(patsubst %.O,%.d,$@)
+ 
+ $(OBJ_DIR)/%.marm.o: %.c
+ 	$(Q)if [ ! -d $(dir $@) ]; then mkdir -p $(dir $@); fi
+ 	$(Q)$(ECHO) "  $(GREEN)CC   $<$(NC)"
+-	$(Q)$(CC) $(OSFLAGS) $(INCLUDES) -c $< -o $@
+-	$(Q)$(CC) $(OSFLAGS) $(INCLUDES) -c $< -MM -MT $@ -MF $(patsubst %.marm.o,%.d,$@)
++	$(Q)$(CC) $(OSFLAGS) $(INCLUDES_RSP) -c $< -o $@
++	$(Q)$(CC) $(OSFLAGS) $(INCLUDES_RSP) -c $< -MM -MT $@ -MF $(patsubst %.marm.o,%.d,$@)
+ 
+ ifeq ($(CFG_SUPPORT_MATTER), 1)
+ CHIP:
+
+--- a/beken378/func/at_server/include/at_svr_opts.h
++++ b/beken378/func/at_server/include/at_svr_opts.h
+@@ -13,16 +13,20 @@
+ 
+ #define ATSVR_POWER_UP_READY_DELAY          400
+ 
+-#define ATSVR_CMDRSP_HEAD                   "CMDRSP:"
+-#define ATSVR_READY_MSG                     "\r\nwww.sparkleiot.com\r\nSDK:https://github.com/Sparkleiot/7238_AT/releases/download/V1.0.0/BK7238-AT.zip \r\nArduino:https://github.com/Sparkleiot/Sparkleiot_BK7238/releases/download/V1.0.0/package_Sparkleiot_Sparkleiot_BK7238_index.json \r\nready!\r\n"
++/* ESP-AT 兼容: ESP32-C3 的 AT 固件应答不带任何 "CMDRSP:" 前缀,
++   这里置空以消除旧版 ATSVR-01.01 遗留前缀,避免上位机解析失败 */
++#define ATSVR_CMDRSP_HEAD                   ""
++#define ATSVR_READY_MSG                     "\r\nwww.sparkleiot.com\r\nBK7238 AT firmware (ESP32-C3 compatible)\r\nready\r\n"
+ #define ATSVR_CMD_RSP_SUCCEED               "OK\r\n"
+ #define ATSVR_CMD_RSP_ERROR                 "ERROR\r\n"
+ #define ATSVR_CMDMSG_ERROR_RSP              "ERROR\r\n"
+ #define ATSVR_RET_CHAR                      '\r'
+ #define ATSVR_END_CHAR		                '\n'
+ 
+-#define ATSVR_EVENT_HEAD                    "EVT:"
+-#define ATSVR_EVT_WLAN_DISCONNECTED         "WFI DISCONNECTED\r\n"
++/* ESP-AT 兼容: 事件不带 "EVT:" 前缀，且断开事件为 "WIFI DISCONNECT"
++   (原厂固件写成 "WFI DISCONNECTED"，上位机按 ESP-AT 匹配会漏掉) */
++#define ATSVR_EVENT_HEAD                    ""
++#define ATSVR_EVT_WLAN_DISCONNECTED         "WIFI DISCONNECT\r\n"
+ #define ATSVR_EVT_WLAN_CONNECTED            "WIFI CONNECTED\r\n"
+ #define ATSVR_EVT_GOT_IP                    "WIFI GOT IP\r\n"
+ 
+
+--- a/beken378/func/at_server/atsvr_cmd/atsvr_cmd.c
++++ b/beken378/func/at_server/atsvr_cmd/atsvr_cmd.c
+@@ -15,6 +15,12 @@
+ 
+ #define MAC_LEN_IN_BYTE  6
+ 
++/* ---- ESP32-C3 / ESP-AT 兼容层 (atsvr_esp_compat.c) ---- */
++extern void atsvr_esp_compat_init(void);
++extern void atsvr_cwjap_query_command(int argc, char **argv);
++/* 按实际命令名生成应答标签（AT+CIPSTA?_CUR/_DEF 共用同一处理函数时需要） */
++extern const char *atsvr_esp_tag(int argc, char **argv, char *buf, int bufsz, const char *fallback);
++
+ int copy_str2mac(unsigned char*mac,char*str)
+ {
+ 	unsigned char hi_byte,lo_byte;
+@@ -89,10 +95,12 @@
+ 		unsigned char mac[MAC_LEN_IN_BYTE];
+ 		int n = 0;
+ 		char resultbuf[200];
++		char tagbuf[24];
++		const char *tag = atsvr_esp_tag(argc, argv, tagbuf, sizeof(tagbuf), "CIPSTAMAC");
+ 
+ 		wlan_get_station_mac_address((char*)mac);
+ 
+-		n = snprintf(resultbuf,sizeof(resultbuf),"+WLMAC:%02x:%02x:%02x:%02x:%02x:%02x\r\n",mac[0],
++		n = snprintf(resultbuf,sizeof(resultbuf),"+%s:\"%02x:%02x:%02x:%02x:%02x:%02x\"\r\n",tag,mac[0],
+ 				mac[1],mac[2],mac[3],mac[4],mac[5]);
+ 		n += snprintf(resultbuf+n,sizeof(resultbuf) - n,"%s",ATSVR_CMD_RSP_SUCCEED);
+ 		atsvr_output_msg(resultbuf,n);
+@@ -108,7 +116,9 @@
+ 	if(argc == 1){
+ 		int n = 0;
+ 		char resultbuf[200];
+-		n = snprintf(resultbuf,sizeof(resultbuf),ATSVR_CMDRSP_HEAD"+CWDHCP:%d\r\n",(g_env_param.stainfo.dhcp | (g_env_param.apinfo.dhcp<<1)));//(g_env_param.stainfo.dhcp & 0x01) | 0x2);
++		char tagbuf[24];
++		const char *tag = atsvr_esp_tag(argc, argv, tagbuf, sizeof(tagbuf), "CWDHCP");
++		n = snprintf(resultbuf,sizeof(resultbuf),"+%s:%d\r\n",tag,(g_env_param.stainfo.dhcp | (g_env_param.apinfo.dhcp<<1)));//(g_env_param.stainfo.dhcp & 0x01) | 0x2);
+ 		n += snprintf(resultbuf+n,sizeof(resultbuf) - n,"%s",ATSVR_CMD_RSP_SUCCEED);
+ 		atsvr_output_msg(resultbuf,n);
+ 	}
+@@ -137,25 +147,23 @@
+ 		operate = 1;
+ 	}
+ 
++	/* ESP-AT 兼容修复: mode 编码改为 0=SoftAP, 1=Station, 2=Station+SoftAP。
++	 * 原厂是 1=sta, 2=ap, 3=both, 0=ERROR —— 与 ESP-AT 文档不符。 */
+ 	switch(mode)
+ 	{
+-		case 0:
+-			atsvr_cmd_rsp_error();
+-		break;
+-		case 1:	//sta
+-			g_env_param.stainfo.dhcp = operate;
+-		break;
+-		case 2:	//ap
++		case 0:	//softap
+ 			g_env_param.apinfo.dhcp = operate;
+ 		break;
+-		case 3:	//sta+ap
++		case 1:	//station
+ 			g_env_param.stainfo.dhcp = operate;
+-			g_env_param.apinfo.dhcp = operate;
+ 		break;
+-		default :
++		case 2:	//station+softap
+ 			g_env_param.stainfo.dhcp = operate;
+ 			g_env_param.apinfo.dhcp = operate;
+ 		break;
++		default :
++			atsvr_cmd_rsp_error();
++			return;
+ 	}
+ 	if(g_env_param.sysstore)
+ 			write_env_to_flash(TAG_SYSSTORE_OFFSET,sizeof(g_env_param),(uint8*)&g_env_param);
+@@ -227,13 +235,14 @@
+ 
+ static void atsvr_station_static_ip(int argc, char **argv)
+ {
+-	if(argc != 4){
++	/* ESP-AT 兼容修复: gateway/netmask 可选 —— AT+CIPSTA=<"ip">[,<"gateway">[,<"netmask">]] */
++	if(argc < 2 || argc > 4){
+ 		atsvr_cmd_rsp_error();
+ 		return;
+ 	}
+ 	char *ip = argv[1];
+-	char *gate = argv[2];
+-	char *mask = argv[3];
++	char *gate = (argc >= 3) ? argv[2] : g_env_param.stainfo.sta_gate;
++	char *mask = (argc >= 4) ? argv[3] : g_env_param.stainfo.sta_mask;
+ 
+ 	if(judge_the_string_is_ipv4_string(ip) != 0){
+ 		atsvr_cmd_rsp_error();
+@@ -311,9 +320,11 @@
+ 
+ 	int n = 0;
+ 	char resultbuf[1024];
+-	n = snprintf(resultbuf,sizeof(resultbuf),"+CIPSTA:ip:%s\r\n",ipStatus.ip);
+-	n += snprintf(resultbuf+n,sizeof(resultbuf) - n,"+CIPSTA:gateway:%s\r\n",ipStatus.gate);
+-	n += snprintf(resultbuf+n,sizeof(resultbuf) - n,"+CIPSTA:netmask:%s\r\n",ipStatus.mask);
++	char tagbuf[24];
++	const char *tag = atsvr_esp_tag(argc, argv, tagbuf, sizeof(tagbuf), "CIPSTA");
++	n = snprintf(resultbuf,sizeof(resultbuf),"+%s:ip:\"%s\"\r\n",tag,ipStatus.ip);
++	n += snprintf(resultbuf+n,sizeof(resultbuf) - n,"+%s:gateway:\"%s\"\r\n",tag,ipStatus.gate);
++	n += snprintf(resultbuf+n,sizeof(resultbuf) - n,"+%s:netmask:\"%s\"\r\n",tag,ipStatus.mask);
+ 	n += snprintf(resultbuf+n,sizeof(resultbuf) - n,"%s",ATSVR_CMD_RSP_SUCCEED);
+ 	atsvr_output_msg(resultbuf,n);
+ 
+@@ -399,24 +410,37 @@
+ 		hidden = atoi(argv[6]);
+ 	}
+ 
++	/* ESP-AT 兼容修复: AT+CWSAP 在任何模式下都应 OK —— 存配置, 待 AP 模式
++	 * 激活时生效(切 CWMODE=2/3 或下次上电)。原厂在 STA 模式直接 ERROR,
++	 * 导致 ESP-AT 流程"先 CWSAP 再 CWMODE=3"永远失败。 */
+ 	if(g_env_param.wifimode.mode < 2){
+-
+-		atsvr_cmd_rsp_error();
++		strcpy(g_env_param.apinfo.ap_ssid,my_ssid);
++		strcpy(g_env_param.apinfo.ap_key,connect_key);
++		g_env_param.apinfo.channel=channel;
++		g_env_param.apinfo.ap_enc=encryp;
++		g_env_param.apinfo.hidden=hidden;
++		if(g_env_param.sysstore)
++			write_env_to_flash(TAG_SYSSTORE_OFFSET,sizeof(ENV_PARAM),(uint8*)&g_env_param);
++		atsvr_cmd_rsp_ok();
+ 		return;
+ 	}
+ 
+-	if(wlan_softap_start(my_ssid, connect_key,channel,g_env_param.apinfo.proto,hidden) == 0){
+-
+-			if(strcmp(g_env_param.apinfo.ap_ssid,my_ssid)!=0 || strcmp(g_env_param.apinfo.ap_key,connect_key)!=0 )
+-			{
+-				strcpy(g_env_param.apinfo.ap_ssid,my_ssid);
+-				strcpy(g_env_param.apinfo.ap_key,connect_key);
+-				g_env_param.apinfo.channel=channel;
+-				g_env_param.apinfo.ap_enc=encryp;
+-				g_env_param.apinfo.hidden=hidden;
+-				if(g_env_param.sysstore)
++	/* ESP-AT CWSAP <ecn> -> BK sec type; don't pass the stale apinfo.proto. */
++	ATSVRLOG("CWSAP argc=%d ssid=%s ch=%d ecn=%d -> bksec=%d\r\n",
++	         argc, my_ssid, channel, encryp, atsvr_ecn_to_bk_sec(encryp));
++	if(wlan_softap_start(my_ssid, connect_key,channel,atsvr_ecn_to_bk_sec(encryp),hidden) == 0){
++
++			/* Always store the new AP config. The old code only persisted it
++			 * when ssid/key changed, so an ecn-only change (e.g. turning an
++			 * open AP into WPA2) was dropped and AT+CWSAP? reported a stale
++			 * ecn forever. */
++			strcpy(g_env_param.apinfo.ap_ssid,my_ssid);
++			strcpy(g_env_param.apinfo.ap_key,connect_key);
++			g_env_param.apinfo.channel=channel;
++			g_env_param.apinfo.ap_enc=encryp;
++			g_env_param.apinfo.hidden=hidden;
++			if(g_env_param.sysstore)
+ 				write_env_to_flash(TAG_SYSSTORE_OFFSET,sizeof(ENV_PARAM),(uint8*)&g_env_param);
+-			}
+ 			atsvr_cmd_rsp_ok();
+ 		}else{
+ 			atsvr_cmd_rsp_error();
+@@ -443,12 +467,43 @@
+ 	return;
+ }
+ 
++static void atsvr_softap_query(int argc, char **argv)
++{
++	char resultbuf[160];
++	char tagbuf[24];
++	int n;
++	uint8 ecn = g_env_param.apinfo.ap_enc;
++	const char *tag = atsvr_esp_tag(argc, argv, tagbuf, sizeof(tagbuf), "CWSAP");
++
++	/* vendor default ap_enc=8 is not a valid ESP-AT ecn (0-4);
++	 * the radio actually broadcasts WPA2_PSK in that case */
++	if (ecn > 4)
++	{
++		ecn = 4;
++	}
++
++	n = snprintf(resultbuf, sizeof(resultbuf),
++	             "+%s:\"%s\",\"%s\",%d,%d\r\n",
++	             tag,
++	             g_env_param.apinfo.ap_ssid,
++	             g_env_param.apinfo.ap_key,
++	             g_env_param.apinfo.channel,
++	             ecn);
++	n += snprintf(resultbuf + n, sizeof(resultbuf) - n,
++	             "%s", ATSVR_CMD_RSP_SUCCEED);
++	atsvr_output_msg(resultbuf, n);
++}
++
+ static void atsvr_softap_query_static_ip(int argc, char **argv)
+ {
+ 	if(argc ==1){
+ 		int n = 0;
+-		char resultbuf[100];
+-		n = snprintf(resultbuf,sizeof(resultbuf),ATSVR_CMDRSP_HEAD"+CIPAP:%s,%s,%s\r\n",g_env_param.apinfo.ap_local_ip,g_env_param.apinfo.ap_mask,g_env_param.apinfo.ap_gate);
++		char resultbuf[256];
++		char tagbuf[24];
++		const char *tag = atsvr_esp_tag(argc, argv, tagbuf, sizeof(tagbuf), "CIPAP");
++		n = snprintf(resultbuf,sizeof(resultbuf),"+%s:ip:\"%s\"\r\n",tag,g_env_param.apinfo.ap_local_ip);
++		n += snprintf(resultbuf+n,sizeof(resultbuf) - n,"+%s:gateway:\"%s\"\r\n",tag,g_env_param.apinfo.ap_gate);
++		n += snprintf(resultbuf+n,sizeof(resultbuf) - n,"+%s:netmask:\"%s\"\r\n",tag,g_env_param.apinfo.ap_mask);
+ 		n += snprintf(resultbuf+n,sizeof(resultbuf) - n,"%s",ATSVR_CMD_RSP_SUCCEED);
+ 		atsvr_output_msg(resultbuf,n);
+ 	}
+@@ -460,14 +515,20 @@
+ 
+ static void atsvr_softap_static_ip(int argc, char **argv)
+ {
+-	if (argc < 4) {
++	/* ESP-AT 兼容修复:
++	 * 1) 参数顺序改为 <"ip">,<"gateway">,<"netmask"> —— 原厂是
++	 *    (ip, mask, gate), 与 ESP-AT 正好相反, 导致按 ESP-AT 文档发
++	 *    AT+CIPAP="ip","gw","mask" 时网关被写成掩码。
++	 * 2) gateway/netmask 为可选参数(与 ESP-AT 一致): 只给 ip 时保持
++	 *    原有 gateway/netmask 不变。 */
++	if (argc < 2 || argc > 4) {
+ 			atsvr_cmd_rsp_error();
+ 			return;
+-		}
++	}
+ 
+ 		char *ip = argv[1];
+-		char *mask = argv[2];
+-		char *gate = argv[3];
++		char *gate = (argc >= 3) ? argv[2] : g_env_param.apinfo.ap_gate;
++		char *mask = (argc >= 4) ? argv[3] : g_env_param.apinfo.ap_mask;
+ 
+ 		if(judge_the_string_is_ipv4_string(ip) != 0){
+ 			atsvr_cmd_rsp_error();
+@@ -492,7 +553,7 @@
+ 			strcpy(g_env_param.apinfo.ap_gate,gate);
+ 
+ 			wlan_stop_softap();
+-			wlan_softap_start(g_env_param.apinfo.ap_ssid, g_env_param.apinfo.ap_key,g_env_param.apinfo.channel,g_env_param.apinfo.proto,g_env_param.apinfo.hidden);
++			wlan_softap_start(g_env_param.apinfo.ap_ssid, g_env_param.apinfo.ap_key,g_env_param.apinfo.channel,atsvr_ecn_to_bk_sec(g_env_param.apinfo.ap_enc),g_env_param.apinfo.hidden);
+ 
+ 			if(g_env_param.sysstore)
+ 				write_env_to_flash(TAG_SYSSTORE_OFFSET,sizeof(ENV_PARAM),(uint8*)&g_env_param);
+@@ -503,6 +564,108 @@
+ 	return;
+ }
+ 
++/* ---------------- ESP-AT 兼容新增: AT+CWDHCPS ----------------
++ * ESP-AT 语义:
++ *   AT+CWDHCPS=<enable>[,<lease time>[,<start IP>[,<end IP>]]]
++ *     enable: 0 关 SoftAP DHCP server, 1 开
++ *     lease time: 分钟(默认 2880), start/end: IP 字符串
++ *   AT+CWDHCPS? -> +CWDHCPS:<lease>,<start>,<end>\r\nOK
++ * range 是运行期配置(ESP-AT 的 _CUR 语义), enable 项会写入 env。 */
++static uint32_t g_ap_dhcp_lease = 2880;      /* minutes */
++static uint32_t g_ap_dhcp_range_start = 0;   /* host order; 0 = 按 AP 子网默认 .2~.101 */
++static uint32_t g_ap_dhcp_range_end = 0;
++
++extern void dhcp_server_set_range(uint32_t start_host, uint32_t end_host);
++
++static int atsvr_parse_ip_u32(const char *s, uint32_t *out)
++{
++	unsigned a,b,c,d;
++	if(!s || sscanf(s, "%u.%u.%u.%u", &a,&b,&c,&d) != 4)
++		return -1;
++	if(a > 255 || b > 255 || c > 255 || d > 255)
++		return -1;
++	*out = (a << 24) | (b << 16) | (c << 8) | d;
++	return 0;
++}
++
++static void atsvr_ip_to_str(uint32_t ip, char *buf, int len)
++{
++	snprintf(buf, len, "%u.%u.%u.%u",
++	         (unsigned)((ip >> 24) & 0xff), (unsigned)((ip >> 16) & 0xff),
++	         (unsigned)((ip >> 8) & 0xff), (unsigned)(ip & 0xff));
++}
++
++static void atsvr_softap_dhcps(int argc, char **argv)
++{
++	if(argc <= 1){
++		/* query: +CWDHCPS:<lease>,"<start>","<end>" */
++		uint32_t s = g_ap_dhcp_range_start, e = g_ap_dhcp_range_end;
++		if(!s || !e){
++			uint32_t apip = 0, apmask = 0;
++			atsvr_parse_ip_u32(g_env_param.apinfo.ap_local_ip, &apip);
++			atsvr_parse_ip_u32(g_env_param.apinfo.ap_mask, &apmask);
++			/* ESP-AT 默认段: AP 子网内 .2 ~ .101 */
++			s = (apip & apmask) | 2;
++			e = (apip & apmask) | 101;
++		}
++		char sbuf[16], ebuf[16];
++		char tagbuf[24];
++		char resultbuf[128];
++		const char *tag = atsvr_esp_tag(argc, argv, tagbuf, sizeof(tagbuf), "CWDHCPS");
++		atsvr_ip_to_str(s, sbuf, sizeof(sbuf));
++		atsvr_ip_to_str(e, ebuf, sizeof(ebuf));
++		int n = snprintf(resultbuf,sizeof(resultbuf),"+%s:%d,\"%s\",\"%s\"\r\n",
++		                  tag, (int)g_ap_dhcp_lease, sbuf, ebuf);
++		n += snprintf(resultbuf+n,sizeof(resultbuf)-n,"%s",ATSVR_CMD_RSP_SUCCEED);
++		atsvr_output_msg(resultbuf,n);
++		return;
++	}
++
++	int enable = atoi(argv[1]);
++	if(enable == 0){
++		g_env_param.apinfo.dhcp = 0;
++	}else if(enable == 1){
++		g_env_param.apinfo.dhcp = 1;
++		if(argc >= 3)
++			g_ap_dhcp_lease = (uint32_t)atoi(argv[2]);
++		if(argc >= 5){
++			uint32_t s, e, apip = 0, apmask = 0;
++			if(atsvr_parse_ip_u32(argv[3], &s) != 0 ||
++			   atsvr_parse_ip_u32(argv[4], &e) != 0 ||
++			   s > e){
++				atsvr_cmd_rsp_error();
++				return;
++			}
++			/* 必须与 AP IP 同网段 */
++			atsvr_parse_ip_u32(g_env_param.apinfo.ap_local_ip, &apip);
++			atsvr_parse_ip_u32(g_env_param.apinfo.ap_mask, &apmask);
++			if(((s ^ apip) & apmask) || ((e ^ apip) & apmask)){
++				atsvr_cmd_rsp_error();
++				return;
++			}
++			g_ap_dhcp_range_start = s;
++			g_ap_dhcp_range_end = e;
++		}
++	}else{
++		atsvr_cmd_rsp_error();
++		return;
++	}
++
++	/* 交给 dhcpd(下一次 SoftAP 起来时生效), 并在 AP 模式下热重启使其立即生效 */
++	dhcp_server_set_range(g_ap_dhcp_range_start, g_ap_dhcp_range_end);
++	if(g_env_param.sysstore)
++		write_env_to_flash(TAG_SYSSTORE_OFFSET,sizeof(g_env_param),(uint8*)&g_env_param);
++	if(g_env_param.wifimode.mode & 0x2){
++		wlan_stop_softap();
++		wlan_softap_start(g_env_param.apinfo.ap_ssid, g_env_param.apinfo.ap_key,
++		                  g_env_param.apinfo.channel,
++		                  atsvr_ecn_to_bk_sec(g_env_param.apinfo.ap_enc),
++		                  g_env_param.apinfo.hidden);
++	}
++	atsvr_cmd_rsp_ok();
++	return;
++}
++
+ void atsvr_get_softap_status(int argc, char **argv)
+ {
+ 	if(argc != 1){
+@@ -511,7 +674,7 @@
+ 	}
+ 
+ 	int n = 0;
+-	char resultbuf[200];
++	char resultbuf[1024];
+ 	wlan_ap_stas_t stas;
+ 	memset(&stas,0,sizeof(wlan_ap_stas_t));
+ 
+@@ -521,7 +684,12 @@
+ 
+ 	for(int index=0;index<stas.num;index++)
+ 	{
+-		n += snprintf(resultbuf+n,sizeof(resultbuf)-n,"+CWLIF:index:%d,ip:%s,mac: "MACSTR", rssi:%d\r\n\r\n",index,ipaddr_ntoa((const ip_addr_t *)&stas.sta[index].ipaddr),MAC2STR((uint8_t*)&stas.sta[index].addr),stas.sta[index].rssi);
++		/* ESP-AT 格式: +CWLIF:<ip addr>,<mac>
++		 * 注意 MACSTR 宏自带尾随空格，这里显式写格式以免污染应答 */
++		n += snprintf(resultbuf+n,sizeof(resultbuf)-n,"+CWLIF:%s,%02x:%02x:%02x:%02x:%02x:%02x\r\n",
++			ipaddr_ntoa((const ip_addr_t *)&stas.sta[index].ipaddr),
++			stas.sta[index].addr[0],stas.sta[index].addr[1],stas.sta[index].addr[2],
++			stas.sta[index].addr[3],stas.sta[index].addr[4],stas.sta[index].addr[5]);
+ 	}
+ 	if(n>0)
+ 	{
+@@ -535,17 +703,24 @@
+ void atsvr_wifimode_command(int argc, char **argv)
+ {
+ 	uint8  mode;
++	uint8  lastmode;
+ 	int n = 0;
+ 	char resultbuf[200];
+ 	uint8 autoconnect;
++	char tagbuf[24];
++	const char *tag = atsvr_esp_tag(argc, argv, tagbuf, sizeof(tagbuf), "CWMODE");
+ 	if(argc == 1){
+-		n = snprintf(resultbuf,sizeof(resultbuf),"+WLMODE:%d,%d\r\n",g_env_param.wifimode.mode,g_env_param.wifimode.autoconnect);
++		n = snprintf(resultbuf,sizeof(resultbuf),"+%s:%d\r\n",tag,g_env_param.wifimode.mode);
+ 		n += snprintf(resultbuf+n,sizeof(resultbuf) - n,"%s",ATSVR_CMD_RSP_SUCCEED);
+ 		atsvr_output_msg(resultbuf,n);
+ 		return;
+ 	}
+ 	else if(argc == 2){
+ 		mode = atoi(argv[1]);
++		/* ESP-AT compat fix: capture lastmode BEFORE overwriting
++		 * g_env_param.wifimode.mode, otherwise update_wifi_action()
++		 * always receives identical modes and does nothing. */
++		lastmode = g_env_param.wifimode.mode;
+ 		g_env_param.wifimode.mode=mode;
+ 		if(g_env_param.sysstore)
+ 			write_env_to_flash(TAG_SYSSTORE_OFFSET,sizeof(ENV_PARAM),(uint8*)&g_env_param);
+@@ -555,6 +730,7 @@
+ 	{
+ 		mode = atoi(argv[1]);
+ 		autoconnect = atoi(argv[2]);
++		lastmode = g_env_param.wifimode.mode;
+ 		g_env_param.wifimode.mode =mode;
+ 		g_env_param.wifimode.autoconnect = autoconnect;
+ 		if(g_env_param.sysstore) {
+@@ -567,7 +743,7 @@
+ 		return;
+ 	}
+ 
+-	update_wifi_action(g_env_param.wifimode.mode,mode);
++	update_wifi_action(lastmode, mode);
+ 	return;
+ }
+ 
+@@ -575,8 +751,10 @@
+ {
+ 	int n = 0;
+ 	char resultbuf[200];
++	char tagbuf[24];
++	const char *tag = atsvr_esp_tag(argc, argv, tagbuf, sizeof(tagbuf), "CWMODE");
+ 	if(argc == 1){
+-		n = snprintf(resultbuf,sizeof(resultbuf),"+WLMODE:%d,%d\r\n",g_env_param.wifimode.mode,g_env_param.wifimode.autoconnect);
++		n = snprintf(resultbuf,sizeof(resultbuf),"+%s:%d\r\n",tag,g_env_param.wifimode.mode);
+ 		n += snprintf(resultbuf+n,sizeof(resultbuf) - n,"%s",ATSVR_CMD_RSP_SUCCEED);
+ 		atsvr_output_msg(resultbuf,n);
+ 		return;
+@@ -667,10 +845,15 @@
+ 	ATSVR_CMD_HADLER("AT+CIPSTAMAC","AT+CIPSTAMAC=<\"mac\">",atsvr_set_station_mac),
+ 
+ 	ATSVR_CMD_HADLER("AT+CWSAP","AT+CWSAP=<\"ssid\">,<\"pwd\">,<channel>,<ecn>,<max conn>,<hidden>",atsvr_softap_start),
++	ATSVR_CMD_HADLER("AT+CWSAP?","AT+CWSAP?",atsvr_softap_query),
++	ATSVR_CMD_HADLER("AT+CWSAP_CUR?","AT+CWSAP_CUR?",atsvr_softap_query),
++	ATSVR_CMD_HADLER("AT+CWSAP_DEF?","AT+CWSAP_DEF?",atsvr_softap_query),
++	ATSVR_CMD_HADLER("AT+CWSAP_CUR","AT+CWSAP_CUR=<\"ssid\">,<\"pwd\">,<channel>,<ecn>",atsvr_softap_start),
++	ATSVR_CMD_HADLER("AT+CWSAP_DEF","AT+CWSAP_DEF=<\"ssid\">,<\"pwd\">,<channel>,<ecn>",atsvr_softap_start),
+ 	ATSVR_CMD_HADLER("AT+CWQIF","AT+CWQIF",atsvr_softap_stop),    //�Ͽ���AP������
+ 
+ 	ATSVR_CMD_HADLER("AT+CIPAP?","AT+CIPAP?",atsvr_softap_query_static_ip),
+-	ATSVR_CMD_HADLER("AT+CIPAP","AT+CIPAP=<\"ip\">,<\"mask\">,<\"gate\">",atsvr_softap_static_ip),
++	ATSVR_CMD_HADLER("AT+CIPAP","AT+CIPAP=<\"ip\">[,<\"gateway\">[,<\"netmask\">]]",atsvr_softap_static_ip),
+ 	ATSVR_CMD_HADLER("AT+CWLIF","AT+CWLIF?",atsvr_get_softap_status),
+ 
+ 	//ATSVR_CMD_HADLER("AT+WLAPPROTO","AT+WLAPPROTO",atsvr_wlan_set_ap_proto_cmd),
+@@ -679,11 +862,40 @@
+ 	ATSVR_CMD_HADLER("AT+CWDHCP?","AT+CWDHCP?",atsvr_set_station_dhcp_query),
+ 	ATSVR_CMD_HADLER("AT+CWDHCP","AT+CWDHCP=<enable>,<mode>",atsvr_set_station_dhcp),
+ 	ATSVR_CMD_HADLER("AT+CWJAP","AT+CWJAP=[<SSID>],[<PWD>][,<bssid>][,<pci_en>][,<reconn_interval>][,<listen_interval>][,scan_mode][,jap_timeout][,<pmf>]",atsvr_station_ssid_pwd),
+-	ATSVR_CMD_HADLER("AT+CWJAP?","AT+CWJAP?",atsvr_station_ssid_pwd),
++	ATSVR_CMD_HADLER("AT+CWJAP?","AT+CWJAP?",atsvr_cwjap_query_command),
+ 	ATSVR_CMD_HADLER("AT+CWQAP","AT+CWQAP",atsvr_station_stop),
+ 	ATSVR_CMD_HADLER("AT+CIPSTA?","AT+CIPSTA?",atsvr_get_information_ip),
+-	ATSVR_CMD_HADLER("AT+CIPSTA","AT+CIPSTA=<\"ip\">,<\"mask\">,<\"gate\">",atsvr_station_static_ip),
++	ATSVR_CMD_HADLER("AT+CIPSTA","AT+CIPSTA=<\"ip\">[,<\"gateway\">[,<\"netmask\">]]",atsvr_station_static_ip),
+ 	ATSVR_CMD_HADLER("AT+STAST?","AT+STAST?",atsvr_get_station_status),
++
++	/* ---- ESP-AT 兼容别名: _CUR(当前值) / _DEF(默认值, 落 flash) ----
++	 * ESP-AT 中 _CUR 与 _DEF 的区别仅在于是否写入 flash;
++	 * 本 SDK 已由 SYSSTORE 开关统一控制持久化, 故两者复用同一处理函数即可,
++	 * 目的只是让上位机的 AT+CWMODE_CUR? / AT+CIPSTA_DEF? 等命令不再返回 ERROR。 */
++	ATSVR_CMD_HADLER("AT+CWMODE_CUR?","AT+CWMODE_CUR?",atsvr_wifimode_query_command),
++	ATSVR_CMD_HADLER("AT+CWMODE_CUR","AT+CWMODE_CUR=<mode>",atsvr_wifimode_command),
++	ATSVR_CMD_HADLER("AT+CWMODE_DEF?","AT+CWMODE_DEF?",atsvr_wifimode_query_command),
++	ATSVR_CMD_HADLER("AT+CWMODE_DEF","AT+CWMODE_DEF=<mode>",atsvr_wifimode_command),
++	ATSVR_CMD_HADLER("AT+CWDHCP_CUR?","AT+CWDHCP_CUR?",atsvr_set_station_dhcp_query),
++	ATSVR_CMD_HADLER("AT+CWDHCP_CUR","AT+CWDHCP_CUR=<enable>,<mode>",atsvr_set_station_dhcp),
++	ATSVR_CMD_HADLER("AT+CWDHCP_DEF?","AT+CWDHCP_DEF?",atsvr_set_station_dhcp_query),
++	ATSVR_CMD_HADLER("AT+CWDHCP_DEF","AT+CWDHCP_DEF=<enable>,<mode>",atsvr_set_station_dhcp),
++	ATSVR_CMD_HADLER("AT+CWDHCPS?","AT+CWDHCPS?",atsvr_softap_dhcps),
++	ATSVR_CMD_HADLER("AT+CWDHCPS","AT+CWDHCPS=<enable>[,<lease>[,\"<start>\"[,\"<end>\"]]]",atsvr_softap_dhcps),
++	ATSVR_CMD_HADLER("AT+CWDHCPS_CUR?","AT+CWDHCPS_CUR?",atsvr_softap_dhcps),
++	ATSVR_CMD_HADLER("AT+CWDHCPS_CUR","AT+CWDHCPS_CUR=<enable>[,<lease>[,\"<start>\"[,\"<end>\"]]]",atsvr_softap_dhcps),
++	ATSVR_CMD_HADLER("AT+CWDHCPS_DEF?","AT+CWDHCPS_DEF?",atsvr_softap_dhcps),
++	ATSVR_CMD_HADLER("AT+CWDHCPS_DEF","AT+CWDHCPS_DEF=<enable>[,<lease>[,\"<start>\"[,\"<end>\"]]]",atsvr_softap_dhcps),
++	ATSVR_CMD_HADLER("AT+CIPSTA_CUR?","AT+CIPSTA_CUR?",atsvr_get_information_ip),
++	ATSVR_CMD_HADLER("AT+CIPSTA_CUR","AT+CIPSTA_CUR=<\"ip\">,<\"mask\">,<\"gate\">",atsvr_station_static_ip),
++	ATSVR_CMD_HADLER("AT+CIPSTA_DEF?","AT+CIPSTA_DEF?",atsvr_get_information_ip),
++	ATSVR_CMD_HADLER("AT+CIPSTA_DEF","AT+CIPSTA_DEF=<\"ip\">,<\"mask\">,<\"gate\">",atsvr_station_static_ip),
++	ATSVR_CMD_HADLER("AT+CIPSTAMAC_CUR?","AT+CIPSTAMAC_CUR?",atsvr_get_station_mac),
++	ATSVR_CMD_HADLER("AT+CIPSTAMAC_DEF?","AT+CIPSTAMAC_DEF?",atsvr_get_station_mac),
++	ATSVR_CMD_HADLER("AT+CIPAP_CUR?","AT+CIPAP_CUR?",atsvr_softap_query_static_ip),
++	ATSVR_CMD_HADLER("AT+CIPAP_DEF?","AT+CIPAP_DEF?",atsvr_softap_query_static_ip),
++	ATSVR_CMD_HADLER("AT+CWJAP_CUR","AT+CWJAP_CUR=[<ssid>],[<pwd>]",atsvr_station_ssid_pwd),
++	ATSVR_CMD_HADLER("AT+CWJAP_DEF","AT+CWJAP_DEF=[<ssid>],[<pwd>]",atsvr_station_ssid_pwd),
+ };
+ 
+ #ifdef CFG_SUPPORT_ESP8266
+@@ -701,6 +913,8 @@
+ #ifdef CFG_SUPPORT_ESP8266
+ 	atsvr_register_commands(atsvc_cmds_table_esp8266, sizeof(atsvc_cmds_table_esp8266) / sizeof(struct _atsvr_command));
+ #endif
++	/* ESP32-C3 / ESP-AT 兼容层: 补齐缺失命令（新增文件 atsvr_esp_compat.c） */
++	atsvr_esp_compat_init();
+ 	//atsvr_extern_cmd_init();
+ 
+ 	atsvr_wlan_init();
+
+--- a/beken378/func/at_server/atsvr_http_cmd/atsvr_http_cmd.c
++++ b/beken378/func/at_server/atsvr_http_cmd/atsvr_http_cmd.c
+@@ -93,11 +93,14 @@
+ 	switch(type)
+ 	{
+ 		case 1:
+-			n = snprintf(resultbuf,64,"+HTTPCLIENT:<%d>\r\n",datalen);
++			/* ESP-AT 兼容修复: 文档里的 <size>/<data> 是占位符, 原厂把尖括号
++			   原样写进了格式串(输出 "+HTTPCLIENT:<29506>"), 上位机按 ESP-AT
++			   解析匹配不到。正确格式: +HTTPCLIENT:<size>,<data> */
++			n = snprintf(resultbuf,64,"+HTTPCLIENT:%d,",datalen);
+ 			atsvr_output_msg(resultbuf,n);
+ 		break;
+ 		case 2:
+-			n = snprintf(resultbuf,64,"+HTTPGETSIZE:<%d>\r\n",datalen);
++			n = snprintf(resultbuf,64,"+HTTPGETSIZE:%d\r\n",datalen);
+ 			n += snprintf(resultbuf+n,sizeof(resultbuf) - n,"%s",ATSVR_CMD_RSP_SUCCEED);
+ 			atsvr_output_msg(resultbuf,n);
+ 		break;
+@@ -108,29 +111,20 @@
+ 	free(resultbuf);
+ }
+ 
+-void http_output_data(int start_len,char *data,int type)
++void http_output_data(int start_len,char *data,int data_len,int type)
+ {
+-	char *resultbuf = NULL;
+-	int n = 0;
+-	resultbuf = (char *)malloc(HTTPSCLIENT_MAX_RECV_LEN);
+-
+-	if(resultbuf == NULL)
++	/* 直接输出 [start_len, start_len+data_len) 的原始字节。
++	   原厂用 ",<%s>\r\n" 拼串: 既带文档占位尖括号, 又依赖 %s ——
++	   响应含 NUL 或超长都会被截断/丢数据。
++
++	   ESP-AT 兼容修复: 这里**不再**追加收尾 "\r\n"。
++	   HTTP_SIZE=1024, 大响应会被 recv 成 ~29 个分片, 每个分片都调一次本函数,
++	   尾部 CRLF 就会被打进正文中间(实测 baidu 页面 29506B 里混进 30 个裸
++	   CRLF)。收尾 CRLF 改由调用方在整个响应输出完后补一次。 */
++	if(type == 1 && data != NULL && data_len > 0)
+ 	{
+-		ATSVRLOG("resultbuf is error\r\n");
+-		atsvr_cmd_rsp_error();
+-		return;
++		atsvr_output_msg(&data[start_len], (unsigned int)data_len);
+ 	}
+-	switch(type)
+-	{
+-		case 1:
+-			n = snprintf(resultbuf,HTTPSCLIENT_MAX_RECV_LEN,",<%s>\r\n",&data[start_len]);
+-			atsvr_output_msg(resultbuf,n);
+-		break;
+-		case 2:
+-		case 3:
+-		break;
+-	}
+-	free(resultbuf);
+ }
+ 
+ void http_output_ok()
+@@ -341,11 +335,37 @@
+ 
+ 			ATSVRLOG("[TLS]recv  %d--%d\r\n",https_data_len,https_data_start_len);
+ 
+-			n = snprintf(resultbuf,HTTPSCLIENT_MAX_RECV_LEN,"+HTTPCLIENT:<%d>,<%s>\r\n",https_data_len,&https_recbuf[https_data_start_len+2]);
+-			n += snprintf(resultbuf+n,HTTPSCLIENT_MAX_RECV_LEN - n,"%s",ATSVR_CMD_RSP_SUCCEED);
+-			atsvr_output_msg(resultbuf,n);
++			/* ESP-AT 兼容修复(两处):
++			   1) 格式串原厂写成 "+HTTPCLIENT:<%d>,<%s>" —— 尖括号是文档占位符,
++			      上位机按 ESP-AT 解析匹配不到 (正确: +HTTPCLIENT:<size>,<data>)。
++			   2) 取值偏移原厂 = ssl_parse_data_start_position() + 2 —— 该函数
++			      返回的已是 "头结束+2", 再加 2 会多吃 2 字节, 实测响应头变成
++			      "TP/1.1 200 OK"(丢了 "HT")。这里改为按 "\r\n\r\n" 定位正文。 */
++			{
++				char *body = strstr((char *)https_recbuf, "\r\n\r\n");
++				int body_off = body ? (int)(body - (char *)https_recbuf) + 4 : 0;
++				int body_len = (int)length - body_off;
++
++				if(body_len < 0)
++				{
++					body_off = 0;
++					body_len = (int)length;
++				}
++
++				n = snprintf(resultbuf, 64, "+HTTPCLIENT:%d,", body_len);
++				atsvr_output_msg(resultbuf, n);
++				if(body_len > 0)
++				{
++					atsvr_output_msg((char *)&https_recbuf[body_off], (unsigned int)body_len);
++				}
++				atsvr_output_msg("\r\n", 2);
++			}
+ 
+ 			ATSVRLOG("[TLS]recv  OK\r\n");
++			/* ESP-AT 兼容修复: 原厂这里 goto exit 跳过了末尾的 http_output_ok(),
++			   于是 HTTPS 请求只吐 "+HTTPCLIENT:<size>,<data>" 而没有收尾 OK,
++			   上位机等到超时。ESP-AT 语义是数据行之后必须跟 OK。 */
++			http_output_ok();
+ 			goto exit;
+ 		}
+ 		else
+@@ -404,6 +424,8 @@
+ 			ATSVRLOG("close http \r\n");
+ 			httpclient_close(&httpclient);
+ 		}
++		/* 正文输出完毕后补一次收尾 CRLF(见 http_output_data 注释) */
++		atsvr_output_msg("\r\n", 2);
+ 		http_output_ok();
+ 	}
+ 	return ;
+
+--- a/beken378/func/at_server/mqtt/atsvr_mqtt_cmd.c
++++ b/beken378/func/at_server/mqtt/atsvr_mqtt_cmd.c
+@@ -26,19 +26,28 @@
+ 	int 			n	= 0;
+ 	MQTTInitParams	conn_params;
+ 
+-	if (ATSVR_RET_SUCCESS == get_mqtt_conn_parameters(&conn_params))
+-	{
+-		n					= snprintf(resultbuf, sizeof(resultbuf), "+MQTTCONNSTATE:%s,%u,%u,%u,%u\r\n",
+-			 get_mqtt_connect_state () > 0 ? "connected": "disconnect", (unsigned int) conn_params.command_timeout,
+-			(unsigned int) conn_params.keep_alive_interval_ms / 1000, conn_params.clean_session,
+-			 conn_params.auto_connect_enable);
+-		n					+= snprintf(resultbuf + n, sizeof(resultbuf) -n, "%s", ATSVR_CMD_RSP_SUCCEED);
+-		atsvr_output_msg(resultbuf, n);
+-	}
+-	else
++	/*
++	 * ESP-AT 兼容: AT+MQTTCONN? 在「未建立连接」时直接返回 ERROR
++	 * (原厂这里是 +MQTTCONNSTATE:disconnect,... , 上位机按 ESP-AT 解析会出错)。
++	 *
++	 * 注意: 本模组的 MQTT 层并未保存 host/port(AT+MQTTCONN 只是就地使用)，
++	 * 因此连接成功时 host 以空串占位，其余字段取真实值。
++	 */
++	if ((ATSVR_RET_SUCCESS != get_mqtt_conn_parameters(&conn_params)) ||
++	    (get_mqtt_connect_state() <= 0))
+ 	{
+ 		atsvr_cmd_rsp_error();
++		return;
+ 	}
++
++	n  = snprintf(resultbuf, sizeof(resultbuf),
++			"+MQTTCONN:%d,1,\"%s\",\"\",0,\"%s\",%u\r\n",
++			g_mqttmconcfg.linkid,
++			(g_mqttmconcfg.contype > 1) ? "SSL" : "TCP",
++			g_mqttmconcfg.path,
++			(unsigned int) conn_params.auto_connect_enable);
++	n += snprintf(resultbuf + n, sizeof(resultbuf) - n, "%s", ATSVR_CMD_RSP_SUCCEED);
++	atsvr_output_msg(resultbuf, n);
+ }
+ 
+ static void _atsvr_MQTTCONN_handle(int argc, char * *argv)
+@@ -145,7 +154,10 @@
+ 	int 			err_code, n = 0;
+ 	char			resultbuf[200];
+ 
+-	if (argc != 2)
++	/* ESP-AT 兼容: AT+MQTTCLEAN=<linkid>, 但上位机普遍省略 link id 直接发
++	   AT+MQTTCLEAN —— 原厂要求 argc==2 会直接回 ERROR(断开失败, 之后
++	   AT+MQTTCONN? 还显示已连接)。这里允许无参(等价 linkid=0), 也兼容带参。 */
++	if (argc > 2)
+ 	{
+ 
+ 		atsvr_cmd_rsp_error();
+@@ -511,17 +523,23 @@
+ 		g_mqttmconcfg.linkid = atoi(argv[1]);
+ 
+ 		size_t			len;
++		int				scheme;
+ 
+-		g_mqttmconcfg.contype = atoi(argv[2]);
++		/* ESP-AT 兼容修复: ESP-AT 的 <scheme> 取值是
++		     1 = MQTT over TCP, 2 = TLS(不校验证书), 3 = TLS(服务端证书),
++		     4 = TLS(双向认证)；内部约定是 NETWORK_TCP=0 / NETWORK_TLS=2。
++		   原厂把 1 映射成 TLS(2) —— 与 ESP-AT 的 1=TCP 恰好相反, 上位机
++		   按 ESP-AT 发 1 会被误走 TLS 而连不上; 且 >1 直接 ERROR 会拒掉
++		   ESP-AT 合法的 2/3/4。这里按 ESP-AT 语义映射(证书类统一走 TLS)。 */
++		scheme = atoi(argv[2]);
+ 
+-		if (g_mqttmconcfg.contype > 1)
++		if (scheme < 0 || scheme > 4)
+ 		{
+ 			atsvr_cmd_rsp_error();
+ 			return;
+ 		}
+ 
+-		if (g_mqttmconcfg.contype == 1)
+-			g_mqttmconcfg.contype = 2; //TLS connect
++		g_mqttmconcfg.contype = (scheme <= 1) ? 0 /*NETWORK_TCP*/ : 2 /*NETWORK_TLS*/;
+ 
+ 		char *			tmp;
+ 
+
+--- a/beken378/func/at_server/atsvr_net_cmd/atsvr_net_cmd.c
++++ b/beken378/func/at_server/atsvr_net_cmd/atsvr_net_cmd.c
+@@ -22,8 +22,46 @@
+ #if CFG_USE_TCPUDP
+ static int g_conmode = 0; //0:单连接;1:多连接
+ 
++/* 供 network_app.c 的接收线程使用: +IPD 前缀需要区分单/多连接 */
++int atsvr_get_conmode(void)
++{
++	return g_conmode;
++}
++
+ extern int create_network_task();
+ extern int network_link_status();
++extern void rtos_thread_msleep(uint32_t milliseconds);
++
++/* 原厂 get_domainip(): 域名 -> IPv4 字符串, 成功返回 1 */
++extern int get_domainip(const char *hname, char *hostip);
++/* ping.c 新增: quiet=1 时不打印原厂调试行, 仅通过 out_ms 回传 RTT(毫秒) */
++extern int at_ping_ex(char *target_name, uint32_t times, size_t size, int quiet, int *out_ms);
++
++/* ESP-AT 的 AT+CIPSTART / AT+PING 都允许直接填域名, 这里统一解析一次。
++   host 已是 IPv4 字面量则直接沿用, 否则走 DNS。成功返回 1 并写入 ipout。
++   注: host 用 char* 而非 const char* —— 原厂 judge_the_string_is_ipv4_string
++   的形参没有 const, 传 const 会被 -Werror=discarded-qualifiers 拦下。 */
++static int atsvr_resolve_host(char *host, char *ipout)
++{
++	if (host == NULL || ipout == NULL || host[0] == '\0')
++	{
++		return 0;
++	}
++
++	if (judge_the_string_is_ipv4_string(host) == 0)
++	{
++		strncpy(ipout, host, 15);
++		ipout[15]		= '\0';
++		return 1;
++	}
++
++	if (get_domainip(host, ipout))
++	{
++		return (judge_the_string_is_ipv4_string(ipout) == 0) ? 1 : 0;
++	}
++
++	return 0;
++}
+ 
+ static void _atsvr_BIPSTATUS_handle(int argc, char * *argv)
+ {
+@@ -33,7 +71,9 @@
+ 		return;
+ 	}
+ 
++	/* ESP-AT 的 AT+CIPSTATUS/AT+CIPSTATUS? 都以 OK 结束 */
+ 	network_link_status();
++	atsvr_cmd_rsp_ok();
+ }
+ 
+ static void _atsvr_BIPSTART_handle(int argc, char * *argv)
+@@ -59,7 +99,8 @@
+ 		{
+ 			rcvmsg.type 		= NETWORK_UDP;
+ 		}
+-		else if ((strcmp(argv[2], "TLS") == 0) || (strcmp(argv[2], "tls") == 0))
++		else if ((strcmp(argv[2], "TLS") == 0) || (strcmp(argv[2], "tls") == 0)
++			|| (strcmp(argv[2], "SSL") == 0) || (strcmp(argv[2], "ssl") == 0))
+ 		{
+ 			rcvmsg.type 		= NETWORK_TLS;
+ 		}
+@@ -74,11 +115,9 @@
+ 			return;
+ 		}
+ 
+-		if (judge_the_string_is_ipv4_string(argv[3]) == 0)
+-		{
+-			strcpy(rcvmsg.remoteip, argv[3]);
+-		}
+-		else
++		/* ESP-AT 允许直接写域名(如 AT+CIPSTART="TCP","www.baidu.com",80),
++		   原厂只接受 IPv4 字面量 —— 这里补上解析。 */
++		if (atsvr_resolve_host(argv[3], rcvmsg.remoteip) == 0)
+ 		{
+ 			ATSVRLOG("argc:3 error\r\n");
+ 			atsvr_cmd_rsp_error();
+@@ -104,27 +143,26 @@
+ 
+ 		if (argc >= 7)
+ 		{
+-			if (judge_the_string_is_ipv4_string(argv[6]) == 0)
+-			{
+-				switch (rcvmsg.type)
+-				{
+-					case NETWORK_TCP:
+-					case NETWORK_TLS:
+-						strcpy(rcvmsg.localip, argv[6]);
+-						break;
+-
+-					case NETWORK_UDP:
+-					case NETWORK_DTLS:
+-						rcvmsg.udpmode = atoi(argv[6]);
+-						break;
+-				}
+-			}
+-			else
++			switch (rcvmsg.type)
+ 			{
+-				ATSVRLOG("argc:7 error\r\n");
+-				atsvr_cmd_rsp_error();
+-				return;
++				case NETWORK_UDP:
++				case NETWORK_DTLS:
++					/* ESP-AT 第 7 参是 udp mode(数字), 原厂误套 IPv4 校验导致永远 ERROR */
++					rcvmsg.udpmode = atoi(argv[6]);
++					break;
+ 
++				default:
++					if (judge_the_string_is_ipv4_string(argv[6]) == 0)
++					{
++						strcpy(rcvmsg.localip, argv[6]);
++					}
++					else
++					{
++						ATSVRLOG("argc:7 error\r\n");
++						atsvr_cmd_rsp_error();
++						return;
++					}
++					break;
+ 			}
+ 		}
+ 
+@@ -180,7 +218,8 @@
+ 		{
+ 			rcvmsg.type 		= NETWORK_UDP;
+ 		}
+-		else if ((strcmp(argv[1], "TLS") == 0) || (strcmp(argv[1], "tls") == 0))
++		else if ((strcmp(argv[1], "TLS") == 0) || (strcmp(argv[1], "tls") == 0)
++			|| (strcmp(argv[1], "SSL") == 0) || (strcmp(argv[1], "ssl") == 0))
+ 		{
+ 			rcvmsg.type 		= NETWORK_TLS;
+ 		}
+@@ -195,11 +234,9 @@
+ 			return;
+ 		}
+ 
+-		if (judge_the_string_is_ipv4_string(argv[2]) == 0)
+-		{
+-			strcpy(rcvmsg.remoteip, argv[2]);
+-		}
+-		else
++		/* 单连接分支同样允许域名: AT+CIPSTART="TCP","www.baidu.com",80
++		   (CIPMUX=1 分支已在上方处理, 这个分支原厂同样只收 IPv4 字面量) */
++		if (atsvr_resolve_host(argv[2], rcvmsg.remoteip) == 0)
+ 		{
+ 			ATSVRLOG("argc:3 error\r\n");
+ 			atsvr_cmd_rsp_error();
+@@ -225,27 +262,26 @@
+ 
+ 		if (argc >= 6)
+ 		{
+-			if (judge_the_string_is_ipv4_string(argv[5]) == 0)
+-			{
+-				switch (rcvmsg.type)
+-				{
+-					case NETWORK_TCP:
+-					case NETWORK_TLS:
+-						strcpy(rcvmsg.localip, argv[5]);
+-						break;
+-
+-					case NETWORK_UDP:
+-					case NETWORK_DTLS:
+-						rcvmsg.udpmode = atoi(argv[5]);
+-						break;
+-				}
+-			}
+-			else
++			switch (rcvmsg.type)
+ 			{
+-				ATSVRLOG("argc:6 error\r\n");
+-				atsvr_cmd_rsp_error();
+-				return;
++				case NETWORK_UDP:
++				case NETWORK_DTLS:
++					/* ESP-AT 第 6 参是 udp mode(数字), 原厂误套 IPv4 校验导致永远 ERROR */
++					rcvmsg.udpmode = atoi(argv[5]);
++					break;
+ 
++				default:
++					if (judge_the_string_is_ipv4_string(argv[5]) == 0)
++					{
++						strcpy(rcvmsg.localip, argv[5]);
++					}
++					else
++					{
++						ATSVRLOG("argc:6 error\r\n");
++						atsvr_cmd_rsp_error();
++						return;
++					}
++					break;
+ 			}
+ 		}
+ 
+@@ -296,6 +332,23 @@
+ 
+ 		linkid = atoi(argv[1]);
+ 
++		/* ESP-AT 兼容修复: AT+CIPCLOSE=5 的语义是"关闭所有连接"(原厂把 5
++		 * 当普通 linkid, 而 link5 恰是服务端槽 —— CIPSERVER 未开时必 ERROR,
++		 * 连接永远关不掉, 残留连接会把后续 CIPSTART 全部顶死)。 */
++		if (linkid == 5)
++		{
++			int i;
++			for (i = 0; i < MAX_SOCKETS_TCP; i++)
++			{
++				if (isconnected_network(i))
++				{
++					network_stop_thread(i);
++				}
++			}
++			atsvr_cmd_rsp_ok();
++			return;
++		}
++
+ 		if (linkid <= 6 && isconnected_network(linkid))
+ 		{
+ 			network_stop_thread(linkid);
+@@ -423,7 +476,15 @@
+ 
+ 			len 				= atoi(argv[1]);
+ 
+-			if (isconnected_network(0) && network_check_connect_type(0, NETWORK_TCP))
++			/* ESP-AT: 单连接模式 AT+CIPSEND=<len> 对 UDP 链路同样有效。
++			   原厂这里只处理 NETWORK_TCP, UDP 链路直接落 else 回 ERROR,
++			   导致 AT+CIPSTART="UDP",... 建链成功后一个包都发不出去。 */
++			/* ESP-AT 兼容修复: 原厂只放行 NETWORK_TCP, TLS 链路一律 ERROR ——
++			   AT+CIPSTART="TLS" 连上了却一个包都发不出去。
++			   network_tcp_send_msg() 内部是通过 at_network_mg[].netwrite 函数指针
++			   分发的, 而 TLS 链路的 netwrite = network_tls_write, 所以它本来就通用。*/
++		if (isconnected_network(0) && (network_check_connect_type(0, NETWORK_TCP)
++									|| network_check_connect_type(0, NETWORK_TLS)))
+ 			{
+ 				g_atsvr_status.network_transfer_mode = ATSVR_PASSTHROUGH_REV_MODE;
+ 				atsvr_cmd_rsp_passthrough();
+@@ -453,6 +514,36 @@
+ 
+ 				return;
+ 			}
++			else if (isconnected_network(0) && network_check_connect_type(0, NETWORK_UDP))
++			{
++				g_atsvr_status.network_transfer_mode = ATSVR_PASSTHROUGH_REV_MODE;
++				atsvr_cmd_rsp_passthrough();
++
++				revlen				= atsvr_input_msg_get(revbuf, len);
++				g_atsvr_status.network_transfer_mode = ATSVR_COMMON_MODE;
++
++				if (network_udp_send_msg(0, (unsigned char *) &revbuf[0], len, NULL, 0) != len)
++				{
++					atsvr_output_msg("SEND ERROR\r\n", strlen("SEND ERROR\r\n"));
++					return;
++				}
++				else
++				{
++					atsvr_output_msg("SEND OK\r\n", strlen("SEND OK\r\n"));
++				}
++
++				if (revlen > len)
++				{
++					int 			n	= 0;
++					char			resultbuf[100];
++
++					n					= snprintf(resultbuf, sizeof(resultbuf), "%s\r\n", &revbuf[len]);
++					atsvr_output_msg(resultbuf, n);
++					atsvr_cmd_rsp_busy();
++				}
++
++				return;
++			}
+ 			else
+ 			{
+ 				atsvr_cmd_rsp_error();
+@@ -481,7 +572,9 @@
+ 			revlen				= atsvr_input_msg_get(revbuf, len);
+ 			g_atsvr_status.network_transfer_mode = ATSVR_COMMON_MODE;
+ 
+-			if(network_check_connect_type(linkid, NETWORK_TCP))
++			/* 同上: 多连接分支也放行 TLS(CIPMUX=1 下的 AT+CIPSEND=<linkid>,<len>) */
++		if(network_check_connect_type(linkid, NETWORK_TCP)
++			|| network_check_connect_type(linkid, NETWORK_TLS))
+ 			{
+ 				if (network_tcp_send_msg(linkid, (unsigned char *) &revbuf[0], len) != len)
+ 				{
+@@ -604,26 +697,116 @@
+ 	return;
+ }
+ 
+-extern int at_ping(char* target_name, uint32_t times, size_t size);
++/* AT+PING 的 ICMP Echo 实现在 atsvr_esp_compat.c（本项目自研）。
++   刻意不复用 SDK 自带的 ping.c —— 那个文件是 GPL v2/v3 传染性组件，
++   为了 ESP-AT 的 +PING:<ms> 语义去改它会把整个衍生作品拖成 GPL。 */
++extern int atsvr_icmp_ping_once(const char *ip, int *out_ms, int timeout_ms);
+ static void _atsvr_PING_handle(int argc, char * *argv)
+ {
++	char			hostip[16];
++	char			resultbuf[64];
++	int 			n	= 0;
++	int 			ms	= -1;
++	int 			ret = 0;
++
+ 	if (argc != 2)
+ 	{
+ 		atsvr_cmd_rsp_error();
+ 		return;
+ 	}
+ 
+-	int 			ret = at_ping(argv[1], 4, 0);
++	/* ESP-AT 语义: 可达回 +PING:<time>(毫秒), 不可达回 +PING:TIMEOUT, 两者都以 OK 结束。
++	   原厂只回一个裸 OK, 上位机无法判断结果, 这里对齐 ESP-AT。 */
++	if (atsvr_resolve_host(argv[1], hostip) == 0)
++	{
++		n		= snprintf(resultbuf, sizeof(resultbuf), "+PING:TIMEOUT\r\n%s", ATSVR_CMD_RSP_SUCCEED);
++		atsvr_output_msg(resultbuf, n);
++		return;
++	}
++
++	ret 		= atsvr_icmp_ping_once(hostip, &ms, 3000);
+ 
+-	if (ret == -1)
++	if (ret == 0 && ms >= 0)
++	{
++		n		= snprintf(resultbuf, sizeof(resultbuf), "+PING:%d\r\n%s", ms, ATSVR_CMD_RSP_SUCCEED);
++	}
++	else
++	{
++		n		= snprintf(resultbuf, sizeof(resultbuf), "+PING:TIMEOUT\r\n%s", ATSVR_CMD_RSP_SUCCEED);
++	}
++
++	atsvr_output_msg(resultbuf, n);
++
++	return;
++}
++
++
++/* ---- ESP-AT AT+CIPSSLCCONF 兼容 -----------------------------------------
++   ESP-AT 定义: AT+CIPSSLCCONF=<auth_mode>[,<pki_number>,<ca_number>]
++     auth_mode 0 = 不认证(不校验服务端证书)  <-- 默认, 也是 ESP-AT 官方支持的模式
++     auth_mode 1 = ESP-AT 提供客户端证书给服务端校验
++     auth_mode 2 = 客户端载入 CA 校验服务端证书
++     auth_mode 3 = 相互认证
++   CA 在 ESP-AT 里也是编译期烧进 flash 分区的, 运行时不提供下发命令(AT+SYSMFG
++   是 ESP32 专属扩展)。本移植同样不在运行时装载 CA, 且刻意**不改动 ENV_PARAM
++   布局**(flash env 向后兼容优先), 因此只用函数级静态保存, 复位后回到默认 0。 */
++static int s_ssl_auth_mode = 0;      /* 0 = 不认证 */
++
++int atsvr_get_ssl_auth_mode(void)
++{
++	return s_ssl_auth_mode;
++}
++
++static void _atsvr_at_BIPSSLCONF_Query_command(int argc, char **argv)
++{
++	char	resultbuf[80];
++	int		n	= 0;
++
++	if (argc != 1)
+ 	{
+ 		atsvr_cmd_rsp_error();
+ 		return;
+ 	}
+ 
+-	atsvr_cmd_rsp_ok();
++	/* 本移植没有可配置的 PKI/CA 索引, 固定回 0(与 AT+CIPSSLCCONF=0 一致)。*/
++	n= snprintf(resultbuf, sizeof(resultbuf), "+CIPSSLCCONF:%d,0,0\r\n%s",
++			s_ssl_auth_mode, ATSVR_CMD_RSP_SUCCEED);
++	atsvr_output_msg(resultbuf, n);
++}
+ 
+-	return;
++static void _atsvr_at_BIPSSLCONF_command(int argc, char **argv)
++{
++	int	auth	= 0;
++	int	pki		= 0;
++	int	ca		= 0;
++
++	/* ESP-AT 里 pki_number / ca_number 是可选的(auth_mode=0 时无需填)。*/
++	if (argc != 2 && argc != 3 && argc != 4)
++	{
++		atsvr_cmd_rsp_error();
++		return;
++	}
++
++	auth = atoi(argv[1]);
++	if (argc >= 3)
++	{
++		pki	= atoi(argv[2]);
++	}
++	if (argc >= 4)
++	{
++		ca	= atoi(argv[3]);
++	}
++
++	if (auth < 0 || auth > 3 || pki < 0 || ca < 0)
++	{
++		ATSVRLOG("CIPSSLCCONF: bad args\r\n");
++		atsvr_cmd_rsp_error();
++		return;
++	}
++
++	/* 必须在建连之前生效: 改完直接下一次 CIPSTART 生效, 与 ESP-AT 一致。*/
++	s_ssl_auth_mode	= auth;
++	atsvr_cmd_rsp_ok();
+ }
+ 
+ 
+@@ -835,7 +1018,7 @@
+ 				return;
+ 			}
+ 
+-			n					= snprintf(resultbuf, sizeof(resultbuf), "+CIPDOMAIN:%s\r\n", remoteip);
++			n					= snprintf(resultbuf, sizeof(resultbuf), "+CIPDOMAIN:\"%s\"\r\n", remoteip);
+ 			n					+= snprintf(resultbuf + n, sizeof(resultbuf) -n, "%s", ATSVR_CMD_RSP_SUCCEED);
+ 			atsvr_output_msg(resultbuf, n);
+ 			return;
+@@ -846,6 +1029,9 @@
+ 		atsvr_cmd_rsp_error();
+ 		return;
+ 	}
++
++	/* 解析失败也必须给应答, 否则上位机会一直等 (ESP-AT 行为: 回 ERROR) */
++	atsvr_cmd_rsp_error();
+ }
+ 
+ void _atsvr__atsvr_at_BIPDNS_command(int argc, char * *argv)
+@@ -939,7 +1125,7 @@
+ #ifdef CFG_SUPPORT_ESP8266
+ void atsvr_savetranslink_command(int argc, char **argv)
+ {
+-	if(argc != 4 && argc != 5){
++	if(argc != 2 && argc != 4 && argc != 5){
+ 			atsvr_cmd_rsp_error();
+ 			return;
+ 	}
+@@ -949,6 +1135,24 @@
+ 	char* type = NULL;
+ 
+ 	mode = atoi(argv[1]);
++
++	/* ESP-AT 兼容修复: ESP-AT 允许 AT+SAVETRANSLINK=<mode> 单参数形式,
++	   mode=0 即"关闭保存透传"。原厂强制 argc==4|5, 于是 "=0" 直接回 ERROR,
++	   上位机没法单独关掉这个功能, 只能硬塞一对无意义的 host/port。
++	   这里补上单参数分支: mode=0 -> 清 autotransinfo + 回到普通模式;
++	   mode!=0 因缺 host/port 无意义 -> ERROR。 */
++	if(argc == 2){
++		if(mode == 0){
++			g_env_param.net_transmission_mode = ATSVR_COMMON_MODE;
++			g_env_param.autotransinfo.enable = 0;
++			write_env_to_flash(TAG_SYSSTORE_OFFSET, sizeof(ENV_PARAM), (uint8 *) &g_env_param);
++			atsvr_cmd_rsp_ok();
++		}else{
++			atsvr_cmd_rsp_error();
++		}
++		return;
++	}
++
+ 	remote_host = argv[2];
+ 	remote_port = atoi(argv[3]);
+ 	if(argc == 4){
+@@ -994,15 +1198,23 @@
+ 		atsvr_cmd_rsp_error();
+ 		return;
+ 	}
+-	if(isconnected_network(0) || !g_conmode){
+-		atsvr_cmd_rsp_error();
+-		return;
+-	}
+ 	uint8 mode = 0;
+ 	uint32 param2 = 0;
+ 	NETWORK_TYPE type = NETWORK_TCP;
+ 
+ 	mode = atoi(argv[1]);
++
++	/* 守卫只应限制"开启"服务端:
++	     - CIPMUX=0 时不能开 (ESP-AT 同)
++	   "关闭"(mode=0) 必须永远可用, 否则服务端一旦有客户端就连不上了。
++	   ESP-AT 兼容修复: 服务端使用 link5, link0~4 被客户端占用时开服务端
++	   完全合法 —— 原守卫 isconnected_network(0) 会在"客户端已接入 +
++	   TCP 建连超时(对端已 accept 但本端报 ERROR)留下半开连接"后把
++	   UDP/TCP 服务端一并拒掉。link5 占用时下方已有 stop+重开逻辑。 */
++	if(mode != 0 && !g_conmode){
++		atsvr_cmd_rsp_error();
++		return;
++	}
+ 	if(mode == 1){
+ 		if(argc == 2){
+ 			param2 = 333;
+@@ -1010,7 +1222,7 @@
+ 			param2 = atoi(argv[2]);
+ 		}else if(argc == 4){
+ 			param2 = atoi(argv[2]);
+-			if((strcmp(argv[3], "UDP") == 0) || (strcmp(argv[2], "udp") == 0))
++			if((strcmp(argv[3], "UDP") == 0) || (strcmp(argv[3], "udp") == 0))
+ 			{
+ 				type = NETWORK_UDP;
+ 			}
+@@ -1020,6 +1232,8 @@
+ 		if(isconnected_network(5))
+ 		{
+ 			network_stop_thread(5);
++			/* 等接收线程退出并释放端口, 否则新 listen 会失败 */
++			rtos_thread_msleep(800);
+ 		}
+ 		rcvmsg.type = type;
+ 		rcvmsg.localport = param2;
+@@ -1032,6 +1246,8 @@
+ 				network_stop_thread(linkid);
+ 			}
+ 		}
++		/* 给接收线程时间退出并关 socket, 再回 OK */
++		rtos_thread_msleep(800);
+ 		atsvr_cmd_rsp_ok();
+ 	} else{
+ 		atsvr_cmd_rsp_error();
+@@ -1052,6 +1268,9 @@
+ 	_ATSVR_CMD_HADLER("AT+PING", "AT+PING=<host>", _atsvr_PING_handle),
+ 	_ATSVR_CMD_HADLER("AT+CIPSSLCPSK", "AT+CIPSSLCPSK=<linkid>,<psk_key>,<hint>", _atsvr_at_BIPPSK_command),
+ 	_ATSVR_CMD_HADLER("AT+CIPSSLCPSK?", "AT+CIPSSLCPSK?", _atsvr_at_BIPPSK_Query_command),
++	_ATSVR_CMD_HADLER("AT+CIPSSLCCONF?", "AT+CIPSSLCCONF?", _atsvr_at_BIPSSLCONF_Query_command),
++	_ATSVR_CMD_HADLER("AT+CIPSSLCCONF", "AT+CIPSSLCCONF=<auth_mode>[,<pki_number>,<ca_number>]",
++		_atsvr_at_BIPSSLCONF_command),
+ 	_ATSVR_CMD_HADLER("AT+CIPSNTPCFG?", "AT+CIPSNTPCFG?", _atsvr_at_BIPSNTPCFG_Query_command),
+ 	_ATSVR_CMD_HADLER("AT+CIPSNTPCFG", "AT+CIPSNTPCFG=<enable>,<timezone>,<SNTPserver1>,<SNTPserver2>,<SNTPserver3>,",
+ 		_atsvr_at_BIPSNTPCFG_command),
+
+--- a/beken378/func/at_server/_at_server_port/atsvr_port.c
++++ b/beken378/func/at_server/_at_server_port/atsvr_port.c
+@@ -329,6 +329,53 @@
+ 	return ;
+ }
+ 
++#define ATSVR_SOFTAP_POWERON_DELAY_MS  5000
++
++/* ESP-AT 兼容修复: 上电恢复 SoftAP 不广播 beacon (原问题见下)。
++ *
++ * 原问题: atsvr_poweron_default_action() 在 ATSVR_POWER_UP_READY_DELAY(400ms)
++ * 后就跑, 此时 MAC/RF/驱动栈远未就绪(实测 RF bias/DPLL/xtal 校准要 ~3s 才收敛),
++ * bk_wlan_start_ap_adv() 会静默失败 —— AP 角色注册但 bss/beacon 从未起来:
++ *   * AT+CWMODE? 正常显示 2, AT+CWSAP? 配置齐全
++ *   * STA 永远扫描不到该 AP, 只有运行时 CWMODE 1->2 切换(此时栈已热)才能救回
++ * STA 分支不受影响: wlan_start_station_connect 走 wpa_supplicant 状态机,
++ * 会无限重试, 天然掩盖了这个竞态。
++ *
++ * 修复分两步:
++ *  1) ready 已发出后再等 5s 让 RF/xtal 校准收敛, 然后显式走
++ *     stop -> start 干净路径(与运行时已验证的可靠路径一致)。
++ *  2) 【必须异步】这段等待**不能**在 AT 主线程里做。否则复位后 5.5s 内
++ *     AT 命令完全不响应(实测首条 AT 6.08s 才回 OK), 与 ESP-AT 行为不符;
++ *     更糟的是它会在刚开机时制造一段"系统全空闲"窗口, 把 MCU 省电/深睡
++ *     路径放进来 —— 曾因此导致 tick 定时器停摆、10s 中断看门狗复位、
++ *     整机 boot-loop(见 2026-10-07 日志)。所以这里交给独立线程去等。 */
++static void atsvr_softap_poweron_deferred(UINT32 data)
++{
++	extern int bk_wlan_stop(unsigned int interface);
++	(void)data;
++
++	rtos_delay_milliseconds(ATSVR_SOFTAP_POWERON_DELAY_MS);
++
++	/* 等待期间若用户已用 AT+CWMODE 改掉模式, 就不要再拉起 SoftAP */
++	if (!(g_env_param.wifimode.mode & 0x2)) {
++		rtos_delete_thread(NULL);
++		return;
++	}
++
++	/* BK_SOFT_AP(=0, wlanInterfaceTypedef 首位, wlan_ui_pub.h) ——
++	   该编译单元没拉到 wlan_ui_pub.h, 用字面量避免新增 include。
++	   bk_wlan_stop() 对未运行的 AP 是幂等的。 */
++	bk_wlan_stop(0 /* BK_SOFT_AP */);
++	rtos_delay_milliseconds(500);
++
++	wlan_softap_start(g_env_param.apinfo.ap_ssid, g_env_param.apinfo.ap_key,
++	                  g_env_param.apinfo.channel,
++	                  atsvr_ecn_to_bk_sec(g_env_param.apinfo.ap_enc),
++	                  g_env_param.apinfo.hidden);
++
++	rtos_delete_thread(NULL);
++}
++
+ void atsvr_poweron_default_action()
+ {
+ 	if(g_env_param.sysstore)
+@@ -349,8 +396,13 @@
+ 		}
+ 
+ 		if(g_env_param.wifimode.mode & 0x2){
+-
+-			wlan_softap_start(g_env_param.apinfo.ap_ssid, g_env_param.apinfo.ap_key,g_env_param.apinfo.channel,atsvr_ecn_to_bk_sec(g_env_param.apinfo.ap_enc),g_env_param.apinfo.hidden) ;
++			beken_thread_t th = NULL;
++			if (rtos_create_thread(&th, BEKEN_DEFAULT_WORKER_PRIORITY, "atsp",
++			                       (beken_thread_function_t)atsvr_softap_poweron_deferred,
++			                       (1024 * 4), 0) != kNoErr) {
++				/* 线程起不来也不能让 SoftAP 丢了: 退化成原来的同步路径 */
++				atsvr_softap_poweron_deferred(0);
++			}
+ 		}
+ 
+ 		if(g_env_param.uartinfo.baudrate != 115200){
+
+--- a/beken378/func/at_server/atsvr_cmd/atsvr_wlan.c
++++ b/beken378/func/at_server/atsvr_cmd/atsvr_wlan.c
+@@ -99,8 +99,9 @@
+ 
+ int wlan_softap_start(char * ap_ssid, char * ap_key, int chnnel, int proto, int ssidhidden)
+ {
+-	network_InitTypeDef_st wNetConfig;
++	network_InitTypeDef_ap_st wNetConfig;
+ 	int len;
++	wlan_sec_type_t sec;
+ 
+ 	len = strlen(ap_ssid);
+ 	if(ATSVR_MAX_SSID_LEN < len) {
+@@ -108,20 +109,57 @@
+ 		return -1;
+ 	}
+ 
+-	memset(&wNetConfig, 0x0, sizeof(network_InitTypeDef_st));
+-	strncpy((char *)wNetConfig.wifi_ssid, ap_ssid,33);
+-	strncpy((char *)wNetConfig.wifi_key, ap_key,64);
++	/* proto carries a Beken wlan_sec_type_t (see +WLAPPROTO). When called from
++	 * the ESP-AT CWSAP path the caller already mapped ecn -> BK sec. Guard
++	 * against out-of-range values so the AP always comes up with a sane,
++	 * secured config matching the stored key instead of silently open. */
++	if (proto >= BK_SECURITY_TYPE_NONE && proto <= BK_SECURITY_TYPE_AUTO)
++		sec = (wlan_sec_type_t)proto;
++	else
++		sec = BK_SECURITY_TYPE_WPA2_MIXED;
+ 
+-	wNetConfig.wifi_mode = BK_SOFT_AP;
+-	wNetConfig.dhcp_mode = DHCP_SERVER;
++	memset(&wNetConfig, 0x0, sizeof(network_InitTypeDef_ap_st));
++	strncpy((char *)wNetConfig.wifi_ssid, ap_ssid, 32);
++	wNetConfig.wifi_ssid[32] = '\0';
++	strncpy((char *)wNetConfig.wifi_key, ap_key, 63);
++	wNetConfig.wifi_key[63] = '\0';
++
++	wNetConfig.channel = chnnel;
++	wNetConfig.security = sec;
++	wNetConfig.ssid_hidden = ssidhidden;
++	wNetConfig.max_con = 4;
++	/* ESP-AT 兼容修复: SoftAP DHCP server 跟随 env 开关
++	 * (AT+CWDHCPS=0 / AT+CWDHCP=0,0 必须能真正关掉 DHCP server)。
++	 * net.c 的 uap 分支按 g_ap_dhcp_server_enabled 决定是否 dhcp_server_start()。 */
++	{
++		extern int g_ap_dhcp_server_enabled;
++		g_ap_dhcp_server_enabled = g_env_param.apinfo.dhcp ? 1 : 0;
++		wNetConfig.dhcp_mode = g_env_param.apinfo.dhcp ? DHCP_SERVER : DHCP_DISABLE;
++	}
+ 	wNetConfig.wifi_retry_interval = 100;
+ 	strncpy((char *) wNetConfig.local_ip_addr, (char *) g_env_param.apinfo.ap_local_ip, 16);
+ 	strncpy((char *) wNetConfig.net_mask, (char *) g_env_param.apinfo.ap_mask, 16);
+ 	strncpy((char *) wNetConfig.gateway_ip_addr, (char *) g_env_param.apinfo.ap_gate, 16);
+ 	strncpy((char *) wNetConfig.dns_server_ip_addr, (char *) g_env_param.dnsinfo.dns1, 16);
+ 
+-	ATSVRLOG("softap-ssid:%s  |  key:%s\r\n", wNetConfig.wifi_ssid, wNetConfig.wifi_key);
+-	bk_wlan_start(&wNetConfig);
++	ATSVRLOG("softap-ssid:%s  |  key:%s  |  sec:%d\r\n",
++	         wNetConfig.wifi_ssid, wNetConfig.wifi_key, wNetConfig.security);
++
++	/* ESP-AT compat fix: SoftAP 重配(AT+CWSAP 反复下发 / CWMODE 切换后再
++	 * CWSAP)时, bk_wlan_start_ap_adv() 的 CTRL_IFACE 分支只走
++	 * uap_ip_down -> ap_init -> ap_enable -> ap_reload, 而闭源库的
++	 * bss reload 有 ~25% 概率静默失败 —— SoftAP 从此不再发 beacon,
++	 * 却照样回 OK, 表现为 STA 扫描不到、CWJAP 永远超时, 只有复位才能
++	 * 恢复。上电/复位后的干净路径(stop -> start)100% 可靠, 因此这里在
++	 * AP 角色已存在时显式先完整停掉 SoftAP, 留出 MAC bss 卸载时间,
++	 * 再统一走干净启动路径。bk_wlan_stop() 对未运行的 AP 是幂等的。 */
++	if (bk_wlan_has_role(2 /* VIF_AP, ip/lmac/src/vif/vif_mgmt.h 匿名枚举: STA=0,IBSS=1,AP=2 */))
++	{
++		bk_wlan_stop(BK_SOFT_AP);
++		rtos_delay_milliseconds(500);
++	}
++
++	bk_wlan_start_ap_adv(&wNetConfig);
+ 	return 0;
+ }
+ 
+@@ -200,6 +238,28 @@
+ 	return BK_SECURITY_TYPE_AUTO;
+ }
+ 
++/* ESP-AT CWSAP <ecn> -> Beken wlan_sec_type_t.
++ * ESP-AT ecn: 0=OPEN, 2=WPA_PSK, 3=WPA2_PSK, 4=WPA_WPA2_PSK.
++ * Vendor default ap_enc=8 is not a valid ESP-AT ecn; fall back to WPA2_AES,
++ * which is the same config the vendor's own bk_wlan_ap_init() derives for a
++ * passphrase of >=8 chars. WPA2_AES (CCMP) is used instead of WPA2_MIXED
++ * because the mixed RSN IE (TKIP+AES) is not accepted by peers in this build. */
++unsigned char atsvr_ecn_to_bk_sec(unsigned char ecn)
++{
++	switch(ecn){
++	case 0:
++		return BK_SECURITY_TYPE_NONE;
++	case 2:
++		return BK_SECURITY_TYPE_WPA_AES;
++	case 3:
++		return BK_SECURITY_TYPE_WPA2_AES;
++	case 4:
++		return BK_SECURITY_TYPE_WPA2_MIXED;
++	default:
++		return BK_SECURITY_TYPE_WPA2_AES;
++	}
++}
++
+ static beken_semaphore_t atsvr_scan_sema = NULL;
+ 
+ static void atsvr_wlan_scan_callback(void *ctxt, unsigned char param)
+@@ -507,7 +567,10 @@
+ 							n += sprintf(resultbuf+n,"\"%s\",",apList.ApList[i].ssid);
+ 						}
+ 						n += sprintf(resultbuf+n,"%d,",apList.ApList[i].ApPower); ///RSSI
+-						n += sprintf(resultbuf+n,"\""ATSVR_MACSTR"\",",apList.ApList[i].bssid[0],
++						/* 不用 ATSVR_MACSTR: 它结尾带一个空格, 会变成
++						   "aa:bb:cc:dd:ee:01 " 这种带尾空格的 BSSID,
++						   ESP-AT 上位机按字符串比较 MAC 时会匹配失败。 */
++						n += sprintf(resultbuf+n,"\"%02x:%02x:%02x:%02x:%02x:%02x\",",apList.ApList[i].bssid[0],
+ 										apList.ApList[i].bssid[1],apList.ApList[i].bssid[2],
+ 										apList.ApList[i].bssid[3],apList.ApList[i].bssid[4],
+ 										apList.ApList[i].bssid[5]);
+@@ -759,6 +822,19 @@
+ 			{
+ 				wlan_stop_softap();
+ 			}
++			else
++			{
++				/* ESP-AT compat fix: AP mode bit newly added at runtime
++				 * (e.g. AT+CWMODE=3 while running as STA-only) must bring
++				 * the SoftAP up with the stored configuration, mirroring
++				 * the power-on path in atsvr_poweron_default_action().
++				 * Original firmware only ever *stopped* interfaces here. */
++				wlan_softap_start(g_env_param.apinfo.ap_ssid,
++				                  g_env_param.apinfo.ap_key,
++				                  g_env_param.apinfo.channel,
++				                  atsvr_ecn_to_bk_sec(g_env_param.apinfo.ap_enc),
++				                  g_env_param.apinfo.hidden);
++			}
+ 		}
+ 	}
+ 
+
+--- a/beken378/func/at_server/atsvr_cmd/atsvr_wlan.h
++++ b/beken378/func/at_server/atsvr_cmd/atsvr_wlan.h
+@@ -101,6 +101,7 @@
+ 
+ extern atsvr_wlan_sec_type wlan2atsvr_sec_type(int sec_type);
+ extern int atsvr2wlan_sec_type(atsvr_wlan_sec_type sec_type);
++extern unsigned char atsvr_ecn_to_bk_sec(unsigned char ecn);
+ extern int judge_the_string_is_ipv4_string(char *is_ip_string);
+ 
+ extern void atsvr_wlan_init(void);
+
+--- a/beken378/beken_src.mk
++++ b/beken378/beken_src.mk
+@@ -908,6 +908,7 @@
+ SRC_FUNC_C += ./beken378/func/at_server/atsvr_cmd/atsvr_wlan.c
+ SRC_FUNC_C += ./beken378/func/at_server/atsvr_cmd/atsvr_ble.c
+ SRC_FUNC_C += ./beken378/func/at_server/atsvr_cmd/atsvr_misc.c
++SRC_FUNC_C += ./beken378/func/at_server/atsvr_cmd/atsvr_esp_compat.c
+ 
+ SRC_FUNC_C += ./beken378/func/at_server/atsvr_http_cmd/atsvr_http_cmd.c
+ SRC_FUNC_C += ./beken378/func/at_server/atsvr_airkiss_cmd/atsvr_airkiss_cmd.c
+
+--- a/beken378/func/lwip_intf/dhcpd/dhcp-priv.h
++++ b/beken378/func/lwip_intf/dhcpd/dhcp-priv.h
+@@ -54,6 +54,8 @@
+ 				 * order */
+ 	uint32_t current_ip;     /* keep track of assigned IP addresses */
+ 	uint32_t router_ip;     /* router IP addresses */
++	uint32_t range_start;   /* host order, ESP-AT compat: lease range start (AT+CWDHCPS) */
++	uint32_t range_end;     /* host order, lease range end */
+     void *prv;
+ };
+ 
+@@ -62,5 +64,7 @@
+ void dhcp_server(void* data);
+ int dhcp_send_halt(void);
+ int dhcp_free_allocations(void);
++/* ESP-AT compat: set lease range (host order). 0/0 = AP subnet default .2~.101 */
++void dhcp_server_set_range(uint32_t start_host, uint32_t end_host);
+ 
+ #endif
+
+--- a/beken378/func/lwip_intf/dhcpd/dhcp-server-main.c
++++ b/beken378/func/lwip_intf/dhcpd/dhcp-server-main.c
+@@ -12,7 +12,22 @@
+ #include "dhcp-priv.h"
+ 
+ static beken_thread_t dhcpd_thread;
+-static bool dhcpd_running;   
++static bool dhcpd_running;
++
++/* ESP-AT compat (AT+CWDHCPS): lease range, host order. 0/0 = default
++ * (AP subnet .2 ~ .101, matching ESP-AT). Survives dhcp_server_init
++ * because dhcp_server_init() reads these each time. */
++static uint32_t pending_range_start = 0;
++static uint32_t pending_range_end = 0;
++
++void dhcp_server_set_range(uint32_t start_host, uint32_t end_host)
++{
++	pending_range_start = start_host;
++	pending_range_end = end_host;
++}
++
++uint32_t dhcp_server_get_pending_range_start(void) { return pending_range_start; }
++uint32_t dhcp_server_get_pending_range_end(void) { return pending_range_end; }
+ 
+ int dhcp_server_start(void *intrfc_handle)
+ {
+
+--- a/beken378/func/lwip_intf/dhcpd/dhcp-server.c
++++ b/beken378/func/lwip_intf/dhcpd/dhcp-server.c
+@@ -157,10 +157,22 @@
+ 		/* next IP address in the subnet */
+ 		dhcps.current_ip = ntohl(dhcps.my_ip & dhcps.netmask) |
+ 			((dhcps.current_ip + 1) & ntohl(~dhcps.netmask));
+-		while (!ac_valid_ip(dhcps.current_ip)) {
+-			dhcps.current_ip = ntohl(dhcps.my_ip & dhcps.netmask) |
+-				((dhcps.current_ip + 1) &
+-				 ntohl(~dhcps.netmask));
++		/* ESP-AT compat (AT+CWDHCPS): keep the lease inside
++		 * [range_start, range_end]; wrap around on overflow. */
++		if (dhcps.current_ip > dhcps.range_end ||
++		    dhcps.current_ip < dhcps.range_start)
++			dhcps.current_ip = dhcps.range_start;
++		/* guard: never spin forever even in a pathological range */
++		{
++			int guard = 1024;
++			while (!ac_valid_ip(dhcps.current_ip) && guard--) {
++				dhcps.current_ip = ntohl(dhcps.my_ip & dhcps.netmask) |
++					((dhcps.current_ip + 1) &
++					 ntohl(~dhcps.netmask));
++				if (dhcps.current_ip > dhcps.range_end ||
++				    dhcps.current_ip < dhcps.range_start)
++					dhcps.current_ip = dhcps.range_start;
++			}
+ 		}
+ 
+ 		new_ip = htonl(dhcps.current_ip);
+@@ -744,9 +756,26 @@
+ 	}
+ 
+     dhcps.prv = intrfc_handle;
+-    
+-	dhcps.current_ip = ntohl(dhcps.my_ip & dhcps.netmask) | ((99) & ntohl(~dhcps.netmask));
+-    //os_printf("[abc] %x, %x, %x\r\n", dhcps.current_ip, dhcps.my_ip, dhcps.router_ip);
++
++	/* ESP-AT compat (AT+CWDHCPS): lease range. Default is AP subnet .2 ~ .101
++	 * (原厂从 .100 起环绕整个子网, ESP-AT 默认段是 .2~.101)。 */
++	{
++		extern uint32_t dhcp_server_get_pending_range_start(void);
++		extern uint32_t dhcp_server_get_pending_range_end(void);
++		uint32_t net = ntohl(dhcps.my_ip & dhcps.netmask);
++		uint32_t rs = dhcp_server_get_pending_range_start();
++		uint32_t re = dhcp_server_get_pending_range_end();
++		if (!rs || !re || rs > re ||
++		    ((rs ^ ntohl(dhcps.my_ip)) & ntohl(dhcps.netmask)) ||
++		    ((re ^ ntohl(dhcps.my_ip)) & ntohl(dhcps.netmask))) {
++			/* 未配置/非法(不在本子网) -> ESP-AT 默认段 */
++			rs = net | 2;
++			re = net | 101;
++		}
++		dhcps.range_start = rs;
++		dhcps.range_end = re;
++		dhcps.current_ip = rs - 1;
++	}
+ 
+ 	return 0;
+ 
+
+--- a/beken378/func/hostapd_intf/hostapd_intf.c
++++ b/beken378/func/hostapd_intf/hostapd_intf.c
+@@ -365,6 +365,19 @@
+         if(staid == 0xff)
+             return 0;
+         hw_key_idx = rwm_mgmt_get_hwkeyidx(param->vif_idx, staid, param->u.crypt.idx);
++
++        /* ESP-AT compat fix: 该站还没有有效 pairwise key 时，
++         * rwm_mgmt_get_hwkeyidx() 会返回哨兵值 MM_SEC_MAX_KEY_NBR + 1(实测 = 65)。
++         * 而 65 同时又是 MM_VIF_TO_MFP_KEY(vif0, key5) —— 一个真实存在的 MFP key 槽位。
++         * 原代码只拿 MM_SEC_MAX_MFP_KEY_NBR 当上界(64 + 2*6 = 76)，哨兵值会被当成
++         * 合法索引下发，于是 hostapd 每次给新关联的站清理 key 都会误删这个 MFP key，
++         * 表现为 WPA2 关联时 AP 一建站就立刻拆站(AP_CONNECT_FAILED)。
++         * station 的 pairwise key 索引只会落在
++         *   MM_STA_TO_KEY(sta_idx) = sta_idx + MM_SEC_DEFAULT_KEY_COUNT
++         * 即 [MM_SEC_DEFAULT_KEY_COUNT, MM_SEC_DEFAULT_KEY_COUNT + CFG_STA_MAX)，
++         * 所以直接按这个范围判断"这个站到底有没有 key"。 */
++        if(hw_key_idx >= (MM_SEC_DEFAULT_KEY_COUNT + CFG_STA_MAX))
++            return 0;
+     }
+ 
+ #if NX_MFP
+
+--- a/beken378/func/lwip_intf/lwip-2.0.2/port/net.c
++++ b/beken378/func/lwip_intf/lwip-2.0.2/port/net.c
+@@ -46,6 +46,11 @@
+ uint32_t sta_ip_start_flag = 0;
+ uint32_t uap_ip_start_flag = 0;
+ 
++/* ESP-AT 兼容修复: SoftAP DHCP server 开关。
++ * wlan_softap_start() 按 g_env_param.apinfo.dhcp (AT+CWDHCPS/AT+CWDHCP)
++ * 设置; 0 时 uap iface up 不再启动 dhcp server。默认 1 保持原行为。 */
++int g_ap_dhcp_server_enabled = 1;
++
+ #if LWIP_IPV6
+ #define IPV6_ADDR_STATE_TENTATIVE       "Tentative"
+ #define IPV6_ADDR_STATE_PREFERRED       "Preferred"
+@@ -649,8 +654,9 @@
+          sta_set_default_netif();
+ 	} else {
+ 		#if CFG_USE_DHCPD
+-		// softap IP up, start dhcp server;
+-		dhcp_server_start(net_get_uap_handle());
++		/* ESP-AT 兼容: AT+CWDHCPS=0 关闭 SoftAP DHCP server 时不启动 */
++		if (g_ap_dhcp_server_enabled)
++			dhcp_server_start(net_get_uap_handle());
+ 		#else
+ 		net_d("warning: dhcpd no open\r\n");
+ 		#endif
+
+--- a/beken378/func/at_server/network/network_app.c
++++ b/beken378/func/at_server/network/network_app.c
+@@ -17,10 +17,14 @@
+ #include "network_app.h"
+ #include "at_server.h"
+ #include "atsvr_wlan.h"
++#include "wlan_ui_pub.h"
+ //#include "lwip/netdb.h"
+ #if CFG_USE_TCPUDP
+ beken_queue_t network_msg_que;
+ 
++/* 定义在 atsvr_net_cmd.c, 0:单连接(CIPMUX=0) 1:多连接(CIPMUX=1) */
++extern int atsvr_get_conmode(void);
++
+ #define MAX_ITEM_COUNT      (15)
+ #define MAX_SOCKET_LINK     (6)
+ #define UNKNOW_LINK_IDX     0xff
+@@ -31,13 +35,28 @@
+ 
+ int network_creat_thread(beken_thread_function_t       callback, IN void* para, char *threadname)
+ {
+-    strcpy(g_thread_manage[g_thread_index].thread_name,threadname);
+-    g_thread_manage[g_thread_index].user_arg =  para;
+-    g_thread_manage[g_thread_index].stack_size = 4096;
+-    g_thread_manage[g_thread_index].priority = THD_APPLICATION_PRIORITY;
+-    g_thread_manage[g_thread_index].thread_func = callback;
++    /* 原厂缺陷: 线程槽只增不减 —— 只用 g_thread_manage[g_thread_index++],
++       MAX_THREAD_NUM=10, 约 10 条连接(含每次 accept)后槽位耗尽,
++       且继续递增会越界写内存, 之后任何网络连接都建不起来。
++       修复: 优先复用已退出线程的空槽(thread_id==0, 由
++       network_thread_slot_release() 在线程退出时清零)。 */
++    int slot = -1;
++    int i;
++    for (i = 0; i < MAX_THREAD_NUM; i++) {
++        if (g_thread_manage[i].thread_id == 0) { slot = i; break; }
++    }
++    if (slot < 0) {
++        ATSVRLOG("no free thread slot\r\n");
++        return kGeneralErr;
++    }
++
++    strcpy(g_thread_manage[slot].thread_name,threadname);
++    g_thread_manage[slot].user_arg =  para;
++    g_thread_manage[slot].stack_size = 4096;
++    g_thread_manage[slot].priority = THD_APPLICATION_PRIORITY;
++    g_thread_manage[slot].thread_func = callback;
+ 
+-    if(HAL_ThreadCreate( &g_thread_manage[g_thread_index]) ==ATSVR_RET_SUCCESS){
++    if(HAL_ThreadCreate( &g_thread_manage[slot]) ==ATSVR_RET_SUCCESS){
+         g_thread_index++;
+         return kNoErr;
+     }
+@@ -45,13 +64,27 @@
+     return kGeneralErr;
+ }
+ 
++/* 接收线程退出时释放自己的线程槽 —— 与 network_creat_thread 的空槽复用配套 */
++static void network_thread_slot_release(void)
++{
++    beken_thread_t self = (beken_thread_t)rtos_get_current_thread();
++    int i;
++    for (i = 0; i < MAX_THREAD_NUM; i++) {
++        if (g_thread_manage[i].thread_id != 0 &&
++            g_thread_manage[i].thread_id == self) {
++            g_thread_manage[i].thread_id = 0;
++            break;
++        }
++    }
++}
++
+ int network_stop_thread(int linkid)
+ {
+     char linkname[64];
+-    int i = 0;
++    int i = 0, w;
+     sprintf(linkname,"NET_LINK%d",linkid);
+ 
+-    for( i = 0; i < g_thread_index; i++)
++    for( i = 0; i < MAX_THREAD_NUM; i++)
+     {
+         if((strcmp(g_thread_manage[i].thread_name,linkname)==0) && (g_thread_manage[i].thread_id !=0)) {
+             //rtos_thread_join(g_thread_manage[i].pthreadID);
+@@ -61,9 +94,37 @@
+             break;
+         }
+     }
+-    if(i >= g_thread_index)
++    if(i >= MAX_THREAD_NUM)
+         return kGeneralErr;
+ 
++    /* ESP-AT 兼容修复(#13 真因): CIPCLOSE 必须是"同步"的。
++       原来这里只把 threadrunflag 清 FALSE 就返回, 而接收线程还阻塞在
++       netread/select 里, 最多要等 1s 超时才回到循环顶部退出; 它退出时才
++       close(fd) 并把 at_network_mg[linkid].handle 清 0。
++       这段时间里 isconnected_network(linkid)==1, 于是上位机紧接着的
++       AT+CIPSTART=<同一 linkid> 会命中 _atsvr_BIPSTART_handle 里的
++       "if (linkid > 5 || isconnected_network(linkid)) -> linkid error" 直接回 ERROR。
++       实测: CIPCLOSE 后 ≤0.5s 内 CIPSTART 必 ERROR, ≥0.8s 才 OK —— 而 ESP-AT
++       允许立即 CIPCLOSE->CIPSTART, 所以这里是真缺陷(不是端口占用)。
++       修法: 等线程槽真正释放再返回。槽释放发生在 close(fd)+handle=0 之后
++       (见 network_datarev_thread 尾部: 先 disconnect/handle=0, 再 slot_release),
++       所以等到槽没了, handle 必然已归 0。 */
++    for (w = 0; w < 250; w++) {          /* 上限 250×10ms = 2.5s */
++        int busy = 0;
++        for (i = 0; i < MAX_THREAD_NUM; i++) {
++            if (g_thread_manage[i].thread_id != 0 &&
++                strcmp(g_thread_manage[i].thread_name, linkname) == 0) { busy = 1; break; }
++        }
++        if (!busy && at_network_mg[linkid].handle == 0) {
++            break;
++        }
++        rtos_thread_msleep(10);
++    }
++    if (w >= 250) {
++        ATSVRLOG("warn: wait %s exit timeout, handle=%d\r\n",
++                 linkname, (int)at_network_mg[linkid].handle);
++    }
++
+     return kNoErr;
+ }
+ 
+@@ -115,26 +176,69 @@
+      return (at_network_mg[linkid].type == contype) ? 1: 0;
+ }
+ 
+-int network_link_status()
++/*
++ * 逐条打印已建立的连接, 供 AT+CIPSTATUS / AT+CIPSTATE 复用。
++ *   +<tag>:<link ID>,<"type">,<"remote IP">,<remote port>,<local port>,<tetype>
++ *   <tetype>: 0=client, 1=server
++ */
++static int network_dump_links(const char *tag)
+ {
+     int n = 0;
+-    char resultbuf[200]={0};
++    char resultbuf[256];
+ 
+-    if(network_connected_num()) {
+-        for(int i = 0; i< MAX_SOCKET_LINK; i++ )
+-        {
+-            if(isconnected_network(i)) {
+-                n = snprintf(resultbuf,sizeof(resultbuf),"+BIPSTATUS:%d-%d, connected, %d, %s, %d, %d, %d\r\n",
+-                i,at_network_mg[i].handle,at_network_mg[i].type,at_network_mg[i].host,at_network_mg[i].port,at_network_mg[i].localport,at_network_mg[i].is_server);
+-                atsvr_output_msg(resultbuf,n);
+-            }
++    for (int i = 0; i < MAX_SOCKET_LINK; i++) {
++        if (isconnected_network(i)) {
++            n = snprintf(resultbuf, sizeof(resultbuf),
++                         "+%s:%d,\"%s\",\"%s\",%d,%d,%d\r\n",
++                         tag, i,
++                         network_check_connect_type(i, NETWORK_TCP) ? "TCP" : "UDP",
++                         at_network_mg[i].host,
++                         at_network_mg[i].port,
++                         at_network_mg[i].localport,
++                         at_network_mg[i].is_server ? 1 : 0);
++            atsvr_output_msg(resultbuf, n);
+         }
++    }
++    return kNoErr;
++}
++
++/* AT+CIPSTATE —— 新版 ESP-AT 的逐连接查询命令 */
++int network_cipstate_dump(void)
++{
++    return network_dump_links("CIPSTATE");
++}
++
++/*
++ * AT+CIPSTATUS 响应 —— 对齐经典 ESP-AT (ESP32-C3) 格式:
++ *   STATUS:<stat>
++ *   +CIPSTATUS:<link ID>,<"type">,<"remote IP">,<remote port>,<local port>,<tetype>
++ *   <stat>: 0=未连接 1=已连AP无IP 2=已获取IP 3=已建立TCP/UDP连接 4=连接全部关闭 5=WiFi未连接
++ */
++int network_link_status()
++{
++    int n = 0;
++    char resultbuf[64];
++    LinkStatusTypeDef link;
++    IPStatusTypedef   ipStatus;
++    int stat = 5;
++
++    memset(&link, 0, sizeof(link));
++    bk_wlan_get_link_status(&link);
++    memset(&ipStatus, 0, sizeof(ipStatus));
++    bk_wlan_get_ip_status(&ipStatus, BK_STATION);
++
++    if (link.conn_state == 0) {
++        stat = 5;                                   /* WiFi 未连接 */
++    } else if (strcmp(ipStatus.ip, "0.0.0.0") == 0) {
++        stat = 1;                                   /* 已连 AP 但未取到 IP */
+     } else {
+-        n = snprintf(resultbuf,sizeof(resultbuf),"+BIPSTATUS:ALL disconnect\r\n");
+-        atsvr_output_msg(resultbuf,n);
++        stat = network_connected_num() ? 3 : 2;     /* 3: 已建立连接 2: 已取到 IP */
+     }
+ 
+-    return kNoErr;
++    n = snprintf(resultbuf, sizeof(resultbuf), "STATUS:%d\r\n", stat);
++    atsvr_output_msg(resultbuf, n);
++
++    return network_dump_links("CIPSTATUS");
+ }
+ 
+ int network_passthrough_send_msg(unsigned char* sendbuff,int len)
+@@ -144,7 +248,16 @@
+     {
+         if(at_network_mg[i].handle > 0){
+             ATSVRLOG("network_passthrough_send_msg len:%d\n",len);
+-            at_network_mg[i].netwrite(&at_network_mg[i],sendbuff,len,3000,&writelen);
++            /* ESP-AT 透传发送也要按连接类型分派:
++               UDP socket 走 netwrite(TCP connect 语义)发不出去, 必须走 UDP 发送路径 */
++            if (at_network_mg[i].type == NETWORK_UDP)
++            {
++                writelen = network_udp_send_msg(i, sendbuff, len, NULL, 0);
++            }
++            else
++            {
++                at_network_mg[i].netwrite(&at_network_mg[i],sendbuff,len,3000,&writelen);
++            }
+             break;
+         }
+     }
+@@ -230,6 +343,10 @@
+ 
+ extern int wlan_get_sta_localip(char * localip);
+ extern int wlan_get_ap_localip(char * localip);
++/* ESP-AT AT+CIPSSLCCONF 的 auth_mode(0=不认证/默认, 2|3=校验服务端)。
++   实现见 atsvr_net_cmd.c, 放函数级静态, 不进 flash env(避免改动 ENV_PARAM 布局)。*/
++extern int atsvr_get_ssl_auth_mode(void);
++
+ void setup_msg_network(ATNetwork *pATNetwork , pm_socket_info_t msg)
+ {
+     POINTER_SANITY_CHECK_RTN(pATNetwork);
+@@ -240,10 +357,36 @@
+     pATNetwork->keepalive = msg.keepalive;
+     pATNetwork->udpmode = msg.udpmode;
+ 
+-    /*if(pATNetwork->type == NETWORK_TLS || pATNetwork->type == NETWORK_DTLS){
+-    pATNetwork->ssl_connect_params.psk =  g_env_param.deviceinfo.psk_secret;
+-    pATNetwork->ssl_connect_params.psk_length = strlen(g_env_param.deviceinfo.psk_secret);
+-    }*/
++    /* ESP-AT 兼容修复: 原来这整段是被注释掉的, ssl_connect_params 保持全零 ——
++       ca_crt=NULL / psk=NULL / psk_length=0 / timeout_ms=0, 再叠加
++       HAL_TLS_mbedtls.c 里硬编码的 VERIFY_REQUIRED, 导致 AT+CIPSTART="TLS"
++       握手必然失败(能力缺口)。这里按 ESP-AT 语义显式装配:
++         auth_mode  由 AT+CIPSSLCCONF 设置(默认 0 = 不认证), 见 atsvr_net_cmd.c
++         timeout_ms 握手超时兜底 10s(原厂 0 不可控)
++         psk         仅当用户用 AT+CIPSSLCPSK 配过才使用
++         ca_crt      本移植暂不支持运行时装载 CA(与 ESP-AT 一致: CA 在编译期
++                     烧进 flash 分区), 因此恒为 NULL; auth_mode=2/3 时才需要。
++         psk         **刻意保持 NULL**。原厂注释掉的代码想读 env 里的全局 PSK,
++                     但那是"残留"语义: env 里的 PSK 是历史 AT+CIPSSLCPSK 测试留下的,
++                     把它自动套到每一次 TLS 连接上会直接打死证书模式 ——
++                     mbedtls_ssl_conf_psk 会因长度越界(BKEN 的 config.h 里
++                     MBEDTLS_PSK_MAX_LEN 被注释掉, 默认上限 32 字节, 而 env 里存的是
++                     64 个 hex 字符 = 64)返回 0x7100 BAD_INPUT_DATA, 连接必败。
++                     ESP-AT 的模型也是"按 link 显式配置", 不是全局隐式继承。*/
++    #ifndef AUTH_WITH_NOTLS
++    if (pATNetwork->type == NETWORK_TLS || pATNetwork->type == NETWORK_DTLS)
++    {
++        pATNetwork->ssl_connect_params.auth_mode  = atsvr_get_ssl_auth_mode();
++        pATNetwork->ssl_connect_params.timeout_ms = 10000;
++        pATNetwork->ssl_connect_params.ca_crt     = NULL;
++        pATNetwork->ssl_connect_params.ca_crt_len = 0;
++
++        memset(&pATNetwork->ssl_connect_params.psk_id, 0,
++               sizeof(pATNetwork->ssl_connect_params.psk_id));
++        pATNetwork->ssl_connect_params.psk        = NULL;
++        pATNetwork->ssl_connect_params.psk_length = 0;
++    }
++#endif /* AUTH_WITH_NOTLS */
+ 
+     strcpy(pATNetwork->localip,msg.localip);
+     pATNetwork->localport = msg.localport;
+@@ -275,10 +418,16 @@
+     int timeout = 1000;
+     size_t readlen;
+     int linkid = *(int*)data;
++    /* 修复#13: 记住本线程的"世代"。链路被 CIPCLOSE 后立即 CIPSTART 时
++       threadrunflag 会被重新置 TRUE, 旧线程靠 flag 判断会复活; 靠 epoch
++       判断则会在当前 select(≤1s) 超时后干净退出, 且退出时不 disconnect
++       (socket 已属新线程)。 */
++    unsigned int my_epoch = at_network_mg[linkid].rx_epoch;
+     //int linkid = (int)threadpara->data;
+     ATSVRLOG("enter link %d rev thread\r\n",linkid);
+ 
+-    while ( at_network_mg[linkid].threadrunflag == TRUE){
++    while ( at_network_mg[linkid].threadrunflag == TRUE
++            && at_network_mg[linkid].rx_epoch == my_epoch){
+         if(at_network_mg[linkid].is_connected(&at_network_mg[linkid]) > 0){
+             memset(revbuf,0,REV_NETWORK_DATA_LEN);
+             if(at_network_mg[linkid].is_server){
+@@ -288,9 +437,14 @@
+                     char client_ip_str[16];
+                     int tcp_listen_fd = at_network_mg[linkid].handle - LWIP_SOCKET_FD_SHIFT, client_fd = -1;
+                     fd_set readfds;
++                    struct timeval sel_tv;
+                     FD_ZERO( &readfds );
+                     FD_SET( tcp_listen_fd, &readfds );
+-                    select( tcp_listen_fd + 1, &readfds, NULL, NULL, NULL);
++                    /* 带超时的 select: network_stop_thread 只清运行标志,
++                       若无限阻塞, 线程永远醒不来, socket 关不掉 (CIPSERVER=0 失效) */
++                    sel_tv.tv_sec = 0;
++                    sel_tv.tv_usec = 500 * 1000;
++                    select( tcp_listen_fd + 1, &readfds, NULL, NULL, &sel_tv);
+                     if(FD_ISSET( tcp_listen_fd, &readfds)){
+                         client_fd = accept( tcp_listen_fd, (struct sockaddr *) &client_addr, &sockaddr_t_size );
+                         if(client_fd >= 0){
+@@ -298,6 +452,12 @@
+                             os_printf("tcp client %s:%d connected, fd: %d", client_ip_str, client_addr.sin_port, client_fd);
+                             int linkid_client = network_get_idle_linkid();
+                             if(linkid_client != UNKNOW_LINK_IDX){
++                                /* ESP-AT: 服务端 accept 到新连接时上报 <link id>,CONNECT */
++                                {
++                                    char connbuf[24];
++                                    int n = snprintf(connbuf, sizeof(connbuf), "%d,CONNECT\r\n", linkid_client);
++                                    atsvr_output_msg(connbuf, n);
++                                }
+                                 at_network_mg[linkid_client].handle = client_fd + LWIP_SOCKET_FD_SHIFT;
+                                 pm_socket_info_t rcvmsg;
+                                 rcvmsg.linkid = linkid_client;
+@@ -318,35 +478,85 @@
+                     int udp_listen_fd = at_network_mg[linkid].handle - LWIP_SOCKET_FD_SHIFT;
+                     struct sockaddr_in client_addr;
+                     socklen_t client_addr_len = sizeof(client_addr);
++                    struct timeval sel_tv;
+                     FD_ZERO( &readfds );
+                     FD_SET( udp_listen_fd, &readfds );
+-                    select( udp_listen_fd + 1, &readfds, NULL, NULL, NULL);
++                    /* 同 TCP server: 带超时, 让线程能检查 threadrunflag */
++                    sel_tv.tv_sec = 0;
++                    sel_tv.tv_usec = 500 * 1000;
++                    select( udp_listen_fd + 1, &readfds, NULL, NULL, &sel_tv);
+                     if ( FD_ISSET( udp_listen_fd, &readfds ) )
+                     {
+                         if ( FD_ISSET( udp_listen_fd, &readfds ) ) /*one client has data*/
+                         {
+                             readlen = recvfrom( udp_listen_fd, revbuf, 1024, 0 , (struct sockaddr *) &client_addr, &client_addr_len);
+                             //show_udp_recv(revbuf, len);
+-                            if(readlen)
++                            if(readlen > 0)
+                             {
+-                                readlen = sendto( udp_listen_fd, revbuf, readlen, 0 , (struct sockaddr *) &client_addr, sizeof(client_addr));
++                                /* ESP-AT 行为: 收到 UDP 报文时
++                                   1) 记住最近对端, 让 AT+CIPSEND=<id>,<len> 能回复它
++                                   2) 以 +IPD 前缀上报数据, 而不是原样回显 */
++                                char *rip = inet_ntoa(client_addr.sin_addr);
++                                if (rip)
++                                {
++                                    strncpy(at_network_mg[linkid].host, rip,
++                                            sizeof(at_network_mg[linkid].host) - 1);
++                                    at_network_mg[linkid].host[sizeof(at_network_mg[linkid].host) - 1] = '\0';
++                                }
++                                at_network_mg[linkid].port = ntohs(client_addr.sin_port);
++                                {
++                                    int n;
++                                    char headbuf[48];
++                                    /* ESP-AT 透传模式: 收到的数据裸输出, 不加 +IPD 前缀 */
++                                    if (g_atsvr_status.network_transfer_mode != ATSVR_PASSTHROUGH_MODE)
++                                    {
++                                        if (atsvr_get_conmode())
++                                            n = snprintf(headbuf, sizeof(headbuf), "+IPD,%d,%d:", linkid, (int)readlen);
++                                        else
++                                            n = snprintf(headbuf, sizeof(headbuf), "+IPD,%d:", (int)readlen);
++                                        atsvr_output_msg(headbuf, n);
++                                    }
++                                    atsvr_output_msg((char *)revbuf, readlen);
++                                }
+                             }
+                         }
+                     }
+                 }
+             } else if((ret = at_network_mg[linkid].netread(&at_network_mg[linkid],revbuf,REV_NETWORK_DATA_LEN,timeout,&readlen)) == ATSVR_RET_SUCCESS){
+                 int n = 0;
+-                char resultbuf[200];
+-                //n = snprintf(resultbuf,sizeof(resultbuf),"+IPD,%d:%s\r\n",readlen,revbuf);
+-#ifndef CFG_SUPPORT_ESP8266
+-                n = snprintf(resultbuf,sizeof(resultbuf),"+IPD(%d),%d:",linkid,readlen);
+-#endif
+-                atsvr_output_msg((char *)resultbuf,n);
++                char resultbuf[48];
++                /* ESP-AT 接收数据格式:
++                     CIPMUX=0: +IPD,<len>:
++                     CIPMUX=1: +IPD,<link id>,<len>:
++                   原厂这里被 CFG_SUPPORT_ESP8266 裁掉了前缀, 只吐裸数据。
++                   透传模式下 ESP-AT 不加前缀, 裸输出。 */
++                if (g_atsvr_status.network_transfer_mode != ATSVR_PASSTHROUGH_MODE)
++                {
++                    if (atsvr_get_conmode())
++                        n = snprintf(resultbuf,sizeof(resultbuf),"+IPD,%d,%d:",linkid,(int)readlen);
++                    else
++                        n = snprintf(resultbuf,sizeof(resultbuf),"+IPD,%d:",(int)readlen);
++                    atsvr_output_msg((char *)resultbuf,n);
++                }
+                 atsvr_output_msg((char *)revbuf,readlen);
+             }
+             else if(at_network_mg[linkid].type == NETWORK_TCP ||  at_network_mg[linkid].type == NETWORK_TLS){
+                 if(ret == ATSVR_ERR_TCP_READ_FAIL || ret == ATSVR_ERR_TCP_PEER_SHUTDOWN ||  ret == ATSVR_ERR_SSL_READ){
+                     at_network_mg[linkid].disconnect(&at_network_mg[linkid]);
++                    at_network_mg[linkid].handle = 0;
++                    /* ESP-AT: 对端断开时上报 CLOSED 事件并释放链路。
++                       原厂这里不断开、回到循环顶部反复 netconnect 重连,
++                       每次失败还输出 ERROR 干扰上位机解析。 */
++                    {
++                        char closebuf[24];
++                        int n;
++                        if (atsvr_get_conmode())
++                            n = snprintf(closebuf, sizeof(closebuf), "%d,CLOSED\r\n", linkid);
++                        else
++                            n = snprintf(closebuf, sizeof(closebuf), "CLOSED\r\n");
++                        atsvr_output_msg(closebuf, n);
++                    }
++                    goto end;
+                 }
+             }
+         }else{
+@@ -366,6 +576,17 @@
+                         continue;
+                     }
+                 }
++                /* ESP-AT: TCP/TLS 客户端建连成功先输出 CONNECT 事件再回 OK
++                   (UDP 无连接概念, 只回 OK) */
++                if(at_network_mg[linkid].type == NETWORK_TCP ||  at_network_mg[linkid].type == NETWORK_TLS){
++                    char connbuf[24];
++                    int n;
++                    if (atsvr_get_conmode())
++                        n = snprintf(connbuf, sizeof(connbuf), "%d,CONNECT\r\n", linkid);
++                    else
++                        n = snprintf(connbuf, sizeof(connbuf), "CONNECT\r\n");
++                    atsvr_output_msg(connbuf, n);
++                }
+                 if(g_atsvr_status.network_transfer_mode != ATSVR_PASSTHROUGH_MODE){
+                     atsvr_cmd_rsp_ok();
+                 }
+@@ -379,13 +600,14 @@
+         }
+     }
+ 
+-    if(at_network_mg[linkid].handle){
++    if(at_network_mg[linkid].handle && at_network_mg[linkid].rx_epoch == my_epoch){
+         at_network_mg[linkid].disconnect((ATNetwork *)&at_network_mg[linkid]);
+         ATSVRLOG("\r\n network_datarev_thread(NET_LINK%d) exit \r\n",linkid);
+         at_network_mg[linkid].handle = 0;
+     }
+ 
+ end:
++    network_thread_slot_release();
+     rtos_delete_thread(NULL);
+ }
+ 
+@@ -409,8 +631,24 @@
+             interace_network_init(&at_network_mg[msg.linkid]);
+             if(msg.linktype == 2){
+                 at_network_mg[msg.linkid].handle = handle_temp;
++            }else{
++                /* 修复#13(UDP RX 死): CIPCLOSE 只清 threadrunflag, 旧接收线程
++                   可能还卡在 ≤1s 的 select 里; 上位机立即 CIPSTART 同一 linkid
++                   时, 若不处理会出现:
++                   a) 旧线程复活(threadrunflag 被重新置 TRUE), 双线程并发
++                      netconnect → 同一本地端口二次 bind 失败 → socket 泄漏,
++                      接收路径乱死(实测 echo 丢、ICMP 也丢, ~20s 后才自愈);
++                   b) 旧 socket 没人关, fd 泄漏。
++                   这里在新建前: 先把残留旧 socket 关掉(TCP/UDP 的 disconnect
++                   都只是 close(fd), 跨类型安全), 再 rx_epoch++ 让旧线程在
++                   下一次循环检查时退出且不再触碰本链路。 */
++                if (handle_temp) {
++                    at_network_mg[msg.linkid].handle = handle_temp;
++                    at_network_mg[msg.linkid].disconnect(&at_network_mg[msg.linkid]);
++                }
+             }
+             sprintf(threadname,"NET_LINK%d",msg.linkid);
++            at_network_mg[msg.linkid].rx_epoch++;
+             at_network_mg[msg.linkid].threadrunflag = TRUE;
+             network_creat_thread(network_datarev_thread,&msg.linkid,threadname);
+ 
+
+--- a/beken378/func/at_server/network/network_interface.h
++++ b/beken378/func/at_server/network/network_interface.h
+@@ -80,6 +80,15 @@
+ 
+     unsigned int timeout_ms;  // SSL handshake timeout in millisecond
+ 
++    /* ESP-AT 兼容: 对应 AT+CIPSSLCCONF=<auth_mode>[,<pki_number>,<ca_number>]
++       auth_mode: 0 = 不认证(不校验服务端证书, ESP-AT 官方支持的模式, 也是默认值)
++                  1 = ESP-AT 提供客户端证书给服务端校验
++                  2 = 载入 CA 校验服务端证书
++                  3 = 相互认证
++       原厂把 mbedtls 的 authmode 硬编码成 VERIFY_REQUIRED, 而 AT 层根本没有
++       装载 CA 的命令 => CA 链恒为空 => TLS 握手 100% 失败(auth_mode=0 修复)。*/
++    int          auth_mode;
++
+ } SSLConnectParams;
+ 
+ typedef SSLConnectParams TLSConnectParams;
+@@ -123,6 +132,10 @@
+     unsigned short  localport;
+     int             is_server; //0: client 1:server
+     int             threadrunflag;//
++    volatile unsigned int rx_epoch; /* 接收线程"世代"计数, 每次新建接收线程时
++                                       自增, 用于让旧线程在 CIPCLOSE→CIPSTART 竞态
++                                       窗口内不再复活(threadrunflag 会被重新置
++                                       TRUE 而旧线程可能还卡在 1s select 里) */
+ };
+ 
+ struct Timer{
+@@ -512,6 +525,9 @@
+  */
+ uintptr_t HAL_UDP_Connect(const char *host, unsigned int port);
+ 
++/* ESP-AT 兼容(#10): connect 同时 bind 指定本地端口(local_port=0 时不 bind) */
++uintptr_t HAL_UDP_ConnectBind(const char *host, unsigned int port, unsigned short local_port);
++
+ /**
+  * @brief Disconnect with server and release resource
+  *
+
+--- a/beken378/func/at_server/network/network_socket.c
++++ b/beken378/func/at_server/network/network_socket.c
+@@ -131,7 +131,10 @@
+     POINTER_SANITY_CHECK(pNetwork, ATSVR_ERR_INVAL);
+ 
+     if(pNetwork->is_server == 0){
+-        pNetwork->handle = HAL_UDP_Connect(pNetwork->host, pNetwork->port);
++        /* ESP-AT 兼容修复(#10): client UDP 按 AT+CIPSTART 指定的本地端口 bind,
++         * 使对端可向该端口回发(ESP-AT 文档语义)。localport=0 时与原行为一致。 */
++        pNetwork->handle = HAL_UDP_ConnectBind(pNetwork->host, pNetwork->port,
++                                              (unsigned short)pNetwork->localport);
+         if (0 == pNetwork->handle) {
+             return -1;
+         }
+
+--- a/beken378/func/at_server/mqtt/qcloud_at_mqtt.c
++++ b/beken378/func/at_server/mqtt/qcloud_at_mqtt.c
+@@ -90,8 +90,8 @@
+ static void _on_message_callback(void *pClient, MQTTMessage *message, void *userData)
+ {
+     int n;
+-    char resultbuf[MAX_SIZE_OF_PUBL_PAYLOAD]={0};
+-    char *tmp=os_zalloc(message->payload_len+1);
++    char headbuf[160];
++    char *tmp = NULL;
+ 
+     if (message == NULL) {
+         ATSVRLOG("msg null");
+@@ -103,14 +103,32 @@
+         return;
+     }
+ 
+-    strncpy(tmp, (char *)message->payload, message->payload_len);
+-    tmp[message->payload_len]='\0';
+-    ATSVRLOG("recv msg topic: %s, len: %u payload:%s\r\n", message->ptopic, message->payload_len,tmp);
+-    n = snprintf(resultbuf,sizeof(resultbuf), "+MQTTSUBREV://"%s//",%d,//"%s//"//r//n", message->ptopic, message->payload_len,tmp);
+-    atsvr_output_msg(resultbuf,n);
+-#undef AT_MQTTPUB_FIX_LEN
++    tmp = os_zalloc(message->payload_len + 1);
++    if (tmp != NULL) {
++        memcpy(tmp, message->payload, message->payload_len);
++        ATSVRLOG("recv msg topic: %s, len: %u payload:%s\r\n",
++                 message->ptopic, message->payload_len, tmp);
++        os_free(tmp);
++    }
++
++    /* ESP-AT 兼容修复: 订阅收到的消息必须按 ESP-AT 事件格式上报
++         +MQTTSUBRECV:<link id>,<"topic">,<data len>,<data>
++       原厂这里是 "+MQTTSUBREV:\"topic\",len,\"payload\"" —— 事件名拼错
++       (少一个 C)、缺 link id、payload 被加引号, 上位机按 ESP-AT 解析
++       永远匹配不到。link id 用 0(单条 MQTT 连接, 与 ESP-AT 默认一致)。
++       payload 按原始字节输出(可能含非文本数据)。 */
++    n = snprintf(headbuf, sizeof(headbuf), "+MQTTSUBRECV:%d,\"%s\",%d,",
++                 0, message->ptopic, (int)message->payload_len);
++    if (n > 0) {
++        if (n > (int)sizeof(headbuf))
++            n = (int)sizeof(headbuf);
++        atsvr_output_msg(headbuf, (unsigned int)n);
++    }
++    if (message->payload != NULL && message->payload_len > 0) {
++        atsvr_output_msg((char *)message->payload, (unsigned int)message->payload_len);
++    }
++    atsvr_output_msg("\r\n", 2);
+ 
+-    os_free(tmp);
+     return;
+ }
+ 
+
+--- a/beken378/app/http/utils_httpc.c
++++ b/beken378/app/http/utils_httpc.c
+@@ -947,12 +947,26 @@
+     return FAIL_RETURN;
+ }
+ extern void http_output_size(int datalen,int type);
+-extern void http_output_data(int start_len,char *data,int type);
++extern void http_output_data(int start_len,char *data,int data_len,int type);
+ 
+ iotx_err_t user_httpclient_recv_response(httpclient_t *client, uint32_t timeout_ms, httpclient_data_t *client_data,int type)
+ {
+     int reclen = 0, ret = ERROR_HTTP_CONN;
+     int total_len = 0;
++    /* ESP-AT 兼容修复:
++       - header_len : 正文在本次 recv 缓冲里的起始偏移(仅首包解析后有效)
++       - body_sent  : 已经通过 http_output_data 输出的正文字节数
++       - size_printed: 保证 Content-Length 只上报一次
++       原厂实现的问题:
++       1) 只有当整包(头+正文)一次 recv 到齐时才输出, 否则走 else 分支,
++          每个分片都再打印一次 size -> AT+HTTPGETSIZE 出现无限重复的
++          "+HTTPGETSIZE:<len>";
++       2) 首包里附带的正文部分被丢弃(只 total_len += reclen 不输出),
++          导致分片响应的正文丢开头若干字节;
++       3) 输出长度用 ",<%s>\r\n" 依赖 NUL 结尾的字符串。 */
++    int header_len = 0;
++    int body_sent = 0;
++    int size_printed = 0;
+     char *buf = (char *)malloc(HTTP_SIZE);
+     if(buf == NULL)
+     {
+@@ -976,6 +990,9 @@
+         ret = httpclient_recv(client, buf, 1, HTTP_SIZE - 1, &reclen, iotx_time_left(&timer));
+         if(ret == 0)
+         {
++            int body_off = 0;
++            int body_len = 0;
++
+             if(total_len == 0)
+             {
+                 int response_ret = bk_http_get_response(buf);
+@@ -990,28 +1007,48 @@
+                         }
+                     }
+ 
++                    /* 头/正文分界: "\r\n\r\n" 之后即为正文 */
+                     char *header_end = strstr(buf,"\r\n\r\n");
+-                    int header_len=0;
+                     if(header_end)
+                     {
+-                        header_len = header_end-buf+2;
++                        header_len = (int)(header_end - buf) + 4;
+                     }
+ 
+-                    if(reclen == (header_len + client_data->response_content_len+2))
++                    if(!size_printed)
+                     {
+-                        strncpy(client_data->response_buf,buf,reclen);
+                         http_output_size(client_data->response_content_len,type);
+-                        http_output_data(header_len+2,buf,type);
+-                        break;
++                        size_printed = 1;
+                     }
+-                    total_len  += reclen;
++                    body_off = header_len;
++                }
++            }
++
++            /* 本包可用的正文字节(首包要跳过响应头) */
++            body_len = reclen - body_off;
++            if(body_len > 0 && client_data->response_content_len > 0)
++            {
++                /* 严格按 Content-Length 截断, 不把尾部多余的 CRLF 吐出去 */
++                int remain = client_data->response_content_len - body_sent;
++                if(body_len > remain)
++                {
++                    body_len = remain;
+                 }
+             }
+-            else
++            if(body_len > 0)
++            {
++                strncpy(client_data->response_buf, buf, reclen);
++                http_output_data(body_off, buf, body_len, type);
++                body_sent += body_len;
++            }
++
++            total_len += reclen;
++
++            /* 正文收满 Content-Length 即可收工, 不必等对端关连接/超时 */
++            if(client_data->response_content_len > 0
++               && body_sent >= client_data->response_content_len)
+             {
+-                strncpy(client_data->response_buf,buf,reclen);
+-                http_output_size(client_data->response_content_len,type);
+-                http_output_data(0,buf,type);
++                ret = SUCCESS_RETURN;
++                break;
+             }
+         }
+         else
+
+--- a/beken378/func/wlan_ui/wlan_ui.c
++++ b/beken378/func/wlan_ui/wlan_ui.c
+@@ -608,6 +608,12 @@
+ 	/* set AP parameter, ssid, akm, etc. */
+     bk_wlan_ap_init(inNetworkInitParaAP);
+ 
++	/* ESP-AT compat fix: push ssid + passphrase into the hostapd config
++	 * before enabling the AP (see bk_wlan_start_ap_adv()). */
++	wlan_ap_set((uint8_t *)inNetworkInitParaAP->wifi_ssid,
++	            os_strlen(inNetworkInitParaAP->wifi_ssid),
++	            (uint8_t *)inNetworkInitParaAP->wifi_key);
++
+ 	// enable hostapd
+ 	wlan_ap_enable();
+ 
+@@ -1443,8 +1449,16 @@
+         }
+ 
+         g_ap_param_ptr->ssid.length = _MIN(SSID_MAX_LEN, os_strlen(inNetworkInitParaAP->wifi_ssid));
++        os_memset(g_ap_param_ptr->ssid.array, 0, sizeof(g_ap_param_ptr->ssid.array));
+         os_memcpy(g_ap_param_ptr->ssid.array, inNetworkInitParaAP->wifi_ssid, g_ap_param_ptr->ssid.length);
+-        g_ap_param_ptr->key_len = os_strlen(inNetworkInitParaAP->wifi_key);
++
++        /* ESP-AT compat fix: 与官方 bk_wlan_ap_init() 保持一致。
++         * hostapd 直接从 g_ap_param_ptr 读 key/key_len (见 param_config.h)，
++         * 所以 key 必须按 C 字符串补 NUL，并且每次都清掉上一次的残留 ——
++         * 否则换一次更短的密码后，hostapd 会读到旧密码的尾巴。 */
++        os_memset(g_ap_param_ptr->key, 0, sizeof(g_ap_param_ptr->key));
++        g_ap_param_ptr->key_len = _MIN(sizeof(g_ap_param_ptr->key) - 1,
++                                       os_strlen(inNetworkInitParaAP->wifi_key));
+         os_memcpy(g_ap_param_ptr->key, inNetworkInitParaAP->wifi_key, g_ap_param_ptr->key_len);
+ 
+         g_ap_param_ptr->cipher_suite = inNetworkInitParaAP->security;
+@@ -1645,6 +1659,19 @@
+ 	// reload bss configuration
+ 	wlan_ap_reload();
+ 
++	/* ESP-AT compat fix: CFG_WPA_CTRL_IFACE 分支里厂商漏了这一步 ——
++	 * 只有 !CFG_WPA_CTRL_IFACE 分支会调 net_wlan_add_netif()。
++	 * uap_ip_start() 内部只做 net_configure_address()，并不会把 SoftAP 的
++	 * netif 注册进 lwIP 的 netif 链表，后果非常隐蔽:
++	 *   - dhcp_server_start() 是直接拿 g_uap.netif 发帧的, 所以 STA 照样能
++	 *     拿到 IP(我们一度以为网络是通的);
++	 *   - 但 ICMP/TCP/UDP 全都不通 —— 模组 ping 不通自己的网关,
++	 *     AT+CIPSTART 直接回 ERROR, AT+CIPSERVER 也永远等不到连接。
++	 * 必须在 ip_address_set() / uap_ip_start() 之前补上。
++	 * 先 remove 再 add, 以支持 AT+CWSAP 反复重配。 */
++	net_wlan_remove_netif(&g_ap_param_ptr->bssid);
++	net_wlan_add_netif(&g_ap_param_ptr->bssid);
++
+ 	/* now ap has started, set ip address to this interface */
+     ip_address_set(BK_SOFT_AP, inNetworkInitParaAP->dhcp_mode,
+                    inNetworkInitParaAP->local_ip_addr,
+@@ -2479,6 +2506,15 @@
+ 	return rf_ps_enabled;
+ }
+ #endif
++/* CFG_USE_STA_PS=0 时上面的实现被裁掉, 但预编译库(wpa ctrl_iface.c)与
++   net.c/wlan_cli.c 仍有引用, 会给空实现让链接通过。
++   (CFG_USE_STA_PS 保持厂商默认 1 时为死代码, 见 2026-10-07 日志:
++    把它改成 0 会导致上电 SoftAP 恢复路径整体卡死 -> 看门狗 boot-loop。) */
++#if (!CFG_USE_STA_PS)
++int bk_wlan_dtim_rf_ps_disable_send_msg(void) { return 0; }
++int auto_check_dtim_rf_ps_mode(void) { return 0; }
++void sctrl_flash_select_dco(void) {}
++#endif
+ #if (1 == CFG_LOW_VOLTAGE_PS)
+ 
+ int bk_wlan_mcu_suppress_and_sleep(UINT32 sleep_ticks )

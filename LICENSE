@@ -1,0 +1,97 @@
+#开源许可与著作权声明
+
+本项目采用**双轨许可**：自有部分与第三方部分分别适用不同条款。
+
+---
+
+## 第一部分：本项目自有内容
+
+以下内容的著作权归 **Sparkleiot** 所有，采用 **MIT License** 授权：
+
+- `tools/` 下全部 85 个 Python / Shell 工具脚本
+- `test/` 下全部验收报告
+- `docs/` 下全部 Markdown 文档（本文件、AT 指令手册、兼容性差距分析、硬件要点）
+- `docs/发布到GitHub.md`、`docs/发布到GitHub.md` 的操作指引
+- `README.md`
+- `.gitignore`、`.gitattributes`
+- `src/modified/` 中**本项目原创的修改**（即把 Beken AT 固件改造为
+  ESP32-C3 ESP-AT 兼容版本的全部代码工作，详见 `docs/AT指令说明.md`）
+
+### MIT License
+
+```
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+### 关于「本项目原创的修改」这一表述
+
+`src/modified/` 下的文件是从 Beken SDK 派生并修改而来的**衍生作品**，
+其中本项目新增或重写的部分（如 `AT+CIPSSLCCONF` 命令、TLS 参数装配、
+`+IPD` 前缀修复、SoftAP netif 补充等）适用上述 MIT 许可；
+**但这些文件中包含的 Beken 原有代码、以及第三方厂商的代码，
+不适用 MIT 许可**，而适用各自的条款（见 `THIRD_PARTY_NOTICES.md`）。
+
+换言之：**MIT 覆盖的是本项目新增的工作，不是整个文件的全部内容。**
+
+---
+
+## 第二部分：第三方内容
+
+`src/modified/`、`src/vendor-pristine/`、`docs/patches/esp32c3-compat.patch`
+中包含第三方厂商的源代码，其著作权归各原作者所有，按各自条款授权。
+
+**请务必阅读 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)**，
+其中逐项列出了：
+
+| 归属方 | 条款 |
+|--------|------|
+| Tencent THL A29 Limited | MIT License（声明已完整保留在文件内） |
+| Marvell International Ltd. | 条款未明 —— 再分发前请核实 |
+| Alibaba Group Holding Limited | 条款未明 —— 再分发前请核实 |
+| Beken / Sparkleiot | 须遵守 SDK 授权条款 |
+| lwIP / RT-Thread（GPL） | **已从本仓库移除**，原因见 THIRD_PARTY_NOTICES 第五节 |
+
+**第三方文件的原始版权声明始终优先于本文件与 `THIRD_PARTY_NOTICES.md`。**
+
+---
+
+## 第三部分：商标与产品名
+
+- **ESP32、ESP-AT** 是 Espressif Systems 的注册商标。
+  本项目是**独立实现的兼容性固件**，与 Espressif 无隶属或背书关系。
+  本项目提及这些名称仅为说明命令兼容目标。
+- **Beken、Sparkleiot、XH-WB3S、BK7238** 是其各自权利人的商标或产品名。
+- 厂商手册（`docs/*.docx`）版权归其权利人所有，本仓库仅供本模组使用者参考。
+
+---
+
+## 第四部分：固件二进制
+
+`firmware/` 下的 `.bin` 是本项目编译产生的固件镜像，内含 Beken 提供的
+bootloader 等预编译组件。其分发须遵守 Beken / Sparkleiot 的授权条款。
+
+`firmware/BK7238-AT-1.0.14.bin` 是**原厂未修改固件**，版权归 Beken / Sparkleiot 所有，
+本仓库仅提供用于回退。请勿将其用于其他用途。
+
+---
+
+## 第五部分：免责
+
+本项目按「现状」提供，不对适销性或特定用途适用性作任何明示或暗示保证。
+使用本项目导致的任何损失，作者不承担责任。

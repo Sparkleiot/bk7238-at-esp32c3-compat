@@ -1,0 +1,46 @@
+# 原厂 Beken SDK（2.6GB，不入库，见 README 获取与放置说明）
+/sdk/
+
+# 构建工作区与产物
+/work/
+
+# 本地助手数据
+/.workbuddy/
+
+# 编译/烧录流水日志（过程产物，验收只看 test/ 下的最终报告）
+/test/*.log
+tools/*.log
+
+# 原始串口抓包：可能含 WiFi 凭据、MAC、BSSID 等现场信息，且体积大。
+# 测试脚本运行时会自动重建这些目录（os.makedirs），但不入库。
+/test/*_raw/
+/test/diag_raw/
+/test/m2m_raw/
+/test/raw/
+/test/envcmp/
+/test/full_*/
+
+# 本地私有凭据（若有人把密码写进配置）
+.env
+/secrets.json
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 调试符号（可由源码重新生成，10MB+）
+*.elf
+
+# 隐私脱敏映射表（含真实 BSSID/MAC/SSID，本机专用，绝不入库）
+tools/privacy_map.local.py
+
+# --- 版权 / 许可：以下内容不进公开仓库 ---
+
+# lwIP 的 ping.c 是 GPL v2/v3 传染性许可组件，会使整个衍生作品被要求 GPL。
+# 本项目**完全不需要**这个文件：AT+PING 的 ICMP Echo 已在
+# src/modified/atsvr_esp_compat.c 里自研（atsvr_icmp_ping_once），
+# SDK 侧的 ping.c 保持厂商原样、零改动。
+# 这两个文件只是本地研究时留的副本，绝不入库。
+src/modified/ping.c
+src/vendor-pristine/ping.c.orig
+# 一次性排障脚本（用完即弃，不属于交付物）
+tools/diag_cipsstart.py
